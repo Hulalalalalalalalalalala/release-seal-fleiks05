@@ -77,6 +77,15 @@ def main() -> int:
     signing.add_argument("directory", help="directory to read")
     signing.add_argument("private", help="PEM Ed25519 private key (read only)")
     signing.add_argument("manifest", help="manifest to create; must not exist yet")
+    multi = commands.add_parser(
+        "sign-multi",
+        help="sign the inventory with several Ed25519 keys (version 3 manifest)",
+    )
+    multi.add_argument("directory", help="directory to read")
+    multi.add_argument("manifest", help="manifest to create; must not exist yet")
+    multi.add_argument(
+        "private", nargs="+", help="PEM Ed25519 private keys (read only)"
+    )
     checking = commands.add_parser(
         "verify", help="verify a signed manifest against a directory"
     )
@@ -90,6 +99,14 @@ def main() -> int:
     trusted.add_argument("directory", help="directory to check")
     trusted.add_argument("manifest", help="signed manifest to verify")
     trusted.add_argument("store", help="versioned trust store JSON file")
+    policy_check = commands.add_parser(
+        "verify-policy",
+        help="verify a version 3 manifest under a threshold signature policy",
+    )
+    policy_check.add_argument("directory", help="directory to check")
+    policy_check.add_argument("manifest", help="version 3 manifest to verify")
+    policy_check.add_argument("store", help="versioned trust store JSON file")
+    policy_check.add_argument("policy", help="threshold policy JSON file")
     trust = commands.add_parser(
         "trust", help="manage the offline public-key trust store"
     )
@@ -120,6 +137,13 @@ def main() -> int:
 
             result = sign_directory(args.directory, args.private, args.manifest)
             code = 0
+        elif args.command == "sign-multi":
+            from .seal import sign_multi_directory
+
+            result = sign_multi_directory(
+                args.directory, args.manifest, args.private
+            )
+            code = 0
         elif args.command == "verify":
             from .seal import verify_directory
 
@@ -129,6 +153,13 @@ def main() -> int:
             from .trust import verify_trusted
 
             result = verify_trusted(args.directory, args.manifest, args.store)
+            code = 0 if result["valid"] else 1
+        elif args.command == "verify-policy":
+            from .policy import verify_policy
+
+            result = verify_policy(
+                args.directory, args.manifest, args.store, args.policy
+            )
             code = 0 if result["valid"] else 1
         elif args.command == "trust":
             from .trust import import_key, revoke_key

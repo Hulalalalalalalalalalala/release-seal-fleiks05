@@ -169,6 +169,109 @@ class SignTests(SealTestCase):
         with self.assertRaises(SealError):
             sign_directory(self.delivery, self.private, second)
 
+    def test_ordinary_pem_and_json_files_are_deliverable(self):
+        # Detection is by content, not by name: a certificate-style PEM
+        # and ordinary JSON documents must not block the delivery.
+        (self.delivery / "cert.pem").write_bytes(
+            b"-----BEGIN CERTIFICATE-----\nMIIBszCCAVmgAwIB\n"
+            b"-----END CERTIFICATE-----\n"
+        )
+        (self.delivery / "notes.pem").write_bytes(b"not a key at all\n")
+        (self.delivery / "config.json").write_text(
+            json.dumps({"version": 2, "threshold": 1}), encoding="utf-8"
+        )
+        (self.delivery / "data.json").write_text(
+            json.dumps({"kind": "something-else", "keys": [1, 2]}),
+            encoding="utf-8",
+        )
+        document = sign_directory(self.delivery, self.private, self.manifest)
+        paths = [record["path"] for record in document["files"]]
+        self.assertIn("cert.pem", paths)
+        self.assertIn("notes.pem", paths)
+        self.assertIn("config.json", paths)
+        self.assertIn("data.json", paths)
+
+    def test_real_keys_are_rejected_whatever_the_name(self):
+        (self.delivery / "payload.txt").write_bytes(self.private.read_bytes())
+        with self.assertRaises(SealError):
+            sign_directory(self.delivery, self.private, self.manifest)
+        (self.delivery / "payload.txt").unlink()
+        (self.delivery / "bundle.pem").write_bytes(self.public.read_bytes())
+        with self.assertRaises(SealError):
+            sign_directory(self.delivery, self.private, self.manifest)
+
+    def test_trust_store_and_policy_structures_are_rejected_inside_tree(self):
+        (self.delivery / "store.json").write_text(
+            json.dumps({
+                "kind": "release-seal-trust-store",
+                "version": 1,
+                "algorithm": "Ed25519",
+                "keys": {},
+            }),
+            encoding="utf-8",
+        )
+        with self.assertRaises(SealError):
+            sign_directory(self.delivery, self.private, self.manifest)
+        (self.delivery / "store.json").unlink()
+        (self.delivery / "policy.json").write_text(
+            json.dumps({
+                "version": 1,
+                "threshold": 1,
+                "allowed_key_ids": ["0" * 64],
+            }),
+            encoding="utf-8",
+        )
+        with self.assertRaises(SealError):
+            sign_directory(self.delivery, self.private, self.manifest)
+
+    def test_directory_sync_failure_keeps_target_and_reports_durability(self):
+        from release_seal import seal as seal_module
+
+        original = seal_module._sync_directory
+
+        def failing(directory):
+            raise OSError("sync rejected")
+
+        seal_module._sync_directory = failing
+        try:
+            with self.assertRaises(SealError) as caught:
+                sign_directory(self.delivery, self.private, self.manifest)
+        finally:
+            seal_module._sync_directory = original
+        self.assertIn("durability", str(caught.exception))
+        # The complete manifest stays in place and no temp file remains.
+        document = json.loads(self.manifest.read_text(encoding="utf-8"))
+        self.assertEqual(document["version"], 2)
+        self.assertEqual(
+            [p.name for p in self.work.iterdir() if p.suffix == ".tmp"], []
+        )
+
+    def test_replace_sync_failure_keeps_new_store_and_reports_durability(self):
+        from release_seal import seal as seal_module
+        from release_seal.trust import import_key
+
+        import_key(self.public, self.work / "trust.json")
+        other = self.work / "other"
+        other.mkdir()
+        _, other_public = write_keypair(other)
+        original = seal_module._sync_directory
+
+        def failing(directory):
+            raise OSError("sync rejected")
+
+        seal_module._sync_directory = failing
+        try:
+            with self.assertRaises(SealError) as caught:
+                import_key(other_public, self.work / "trust.json")
+        finally:
+            seal_module._sync_directory = original
+        self.assertIn("durability", str(caught.exception))
+        document = json.loads((self.work / "trust.json").read_text())
+        self.assertEqual(len(document["keys"]), 2)
+        self.assertEqual(
+            [p.name for p in self.work.iterdir() if p.suffix == ".tmp"], []
+        )
+
     def test_sign_rejects_directory_whose_mtime_changes_mid_scan(self):
         # Touching a file updates its mtime: the before/after identity
         # snapshots must disagree and force a status-2 failure.

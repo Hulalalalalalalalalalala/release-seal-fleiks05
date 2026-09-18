@@ -1,15 +1,19 @@
 """Sign and verify a directory inventory with Ed25519.
 
-Manifests exist in two versions:
+Manifests exist in three versions:
 
 * version 1 holds ``version``, ``algorithm``, ``hash``, ``files`` and
   ``signature``;
 * version 2 adds ``key_id``, the lowercase SHA-256 hex of the signer's
-  DER SubjectPublicKeyInfo.
+  DER SubjectPublicKeyInfo;
+* version 3 replaces ``signature`` with ``signatures``, an object keyed
+  by signer ``key_id`` holding one Base64 signature per key.
 
-The signature covers every field except ``signature``, serialized with
-keys sorted, no whitespace and no Unicode escaping. Verification accepts
-both versions; signing always emits version 2.
+The signature covers every field except ``signature`` (versions 1 and
+2) or ``signatures`` (version 3), serialized with keys sorted, no
+whitespace and no Unicode escaping. ``verify`` accepts versions 1 and
+2; ``sign`` always emits version 2. Version 3 manifests are produced
+by ``sign-multi`` and checked by ``verify-policy``.
 """
 
 import base64
@@ -37,12 +41,16 @@ from .inventory import inventory, stat_snapshot
 
 VERSION = 1
 VERSION_CURRENT = 2
+VERSION_MULTI = 3
 SUPPORTED_VERSIONS = (1, 2)
+MULTI_VERSIONS = (VERSION_MULTI,)
 ALGORITHM = "Ed25519"
 HASH = "SHA-256"
 TRUST_STORE_KIND = "release-seal-trust-store"
 V1_FIELDS = ("version", "algorithm", "hash", "files", "signature")
 V2_FIELDS = ("version", "algorithm", "hash", "key_id", "files", "signature")
+V3_FIELDS = ("version", "algorithm", "hash", "files", "signatures")
+POLICY_FIELDS = ("version", "threshold", "allowed_key_ids")
 
 _PUBLIC_PEM_MARKERS = (b"-----BEGIN PUBLIC KEY-----", b"-----END PUBLIC KEY-----")
 _PRIVATE_PEM_MARKERS = (b"-----BEGIN PRIVATE KEY-----", b"-----END PRIVATE KEY-----")
@@ -70,8 +78,9 @@ def canonical_payload(version: int, key_id: str | None, files: list[dict]) -> by
     """Return the canonical UTF-8 JSON the signature covers.
 
     The signed body holds every manifest field except ``signature``
-    (including ``key_id`` on version 2), with keys sorted, no whitespace
-    and no Unicode escaping.
+    (versions 1 and 2) or ``signatures`` (version 3) — ``key_id`` is
+    included on version 2 only — with keys sorted, no whitespace and
+    no Unicode escaping.
     """
     body: dict = {
         "version": version,
@@ -79,7 +88,7 @@ def canonical_payload(version: int, key_id: str | None, files: list[dict]) -> by
         "hash": HASH,
         "files": files,
     }
-    if version >= 2:
+    if version == 2:
         body["key_id"] = key_id
     return json.dumps(
         body, ensure_ascii=False, sort_keys=True, separators=(",", ":")
@@ -155,8 +164,30 @@ def valid_record(record: object) -> bool:
     )
 
 
-def load_manifest(path: Path) -> tuple[int, list[dict], bytes, str | None]:
-    """Return (version, files, signature, key_id) from a manifest file."""
+def _decode_signature(value: object, path: Path, *, field: str) -> bytes:
+    if not isinstance(value, str):
+        raise SealError(f"manifest field {field} must be Base64 text: {path}")
+    try:
+        decoded = base64.b64decode(value, validate=True)
+    except (binascii.Error, ValueError) as error:
+        raise SealError(f"manifest signature is not Base64: {path}") from error
+    if len(decoded) != 64:
+        raise SealError(f"manifest signature must be 64 bytes: {path}")
+    return decoded
+
+
+_MANIFEST_FIELDS = {1: V1_FIELDS, 2: V2_FIELDS, 3: V3_FIELDS}
+
+
+def load_manifest(path: Path, versions: tuple = SUPPORTED_VERSIONS):
+    """Return (version, files, signatures, key_id) from a manifest file.
+
+    For versions 1 and 2 ``signatures`` is the single decoded signature
+    and ``key_id`` the manifest's key id (``None`` on version 1). For
+    version 3 ``signatures`` is a dict mapping signer key id to decoded
+    signature and ``key_id`` is ``None``. Only the given ``versions``
+    are accepted.
+    """
     try:
         raw = path.read_bytes()
     except OSError as error:
@@ -171,13 +202,13 @@ def load_manifest(path: Path) -> tuple[int, list[dict], bytes, str | None]:
     if (
         not isinstance(version, int)
         or isinstance(version, bool)
-        or version not in SUPPORTED_VERSIONS
+        or version not in versions
     ):
-        supported = " or ".join(str(value) for value in SUPPORTED_VERSIONS)
+        supported = " or ".join(str(value) for value in versions)
         raise SealError(
             f"manifest field 'version' must be {supported}: {path}"
         )
-    expected = set(V2_FIELDS if version == 2 else V1_FIELDS)
+    expected = set(_MANIFEST_FIELDS[version])
     if set(document) != expected:
         raise SealError(
             f"manifest version {version} must contain exactly "
@@ -200,15 +231,23 @@ def load_manifest(path: Path) -> tuple[int, list[dict], bytes, str | None]:
     paths = [record["path"] for record in files]
     if len(set(paths)) != len(paths):
         raise SealError(f"manifest lists duplicate paths: {path}")
-    signature = document["signature"]
-    if not isinstance(signature, str):
-        raise SealError(f"manifest field 'signature' must be Base64 text: {path}")
-    try:
-        decoded = base64.b64decode(signature, validate=True)
-    except (binascii.Error, ValueError) as error:
-        raise SealError(f"manifest signature is not Base64: {path}") from error
-    if len(decoded) != 64:
-        raise SealError(f"manifest signature must be 64 bytes: {path}")
+    if version == VERSION_MULTI:
+        signatures = document["signatures"]
+        if not isinstance(signatures, dict) or not signatures:
+            raise SealError(
+                f"manifest field 'signatures' must be a non-empty object: {path}"
+            )
+        decoded_multi = {}
+        for signer_id, signature in signatures.items():
+            if not is_key_id(signer_id):
+                raise SealError(
+                    f"manifest 'signatures' holds an invalid key id: {path}"
+                )
+            decoded_multi[signer_id] = _decode_signature(
+                signature, path, field="'signatures'"
+            )
+        return version, files, decoded_multi, None
+    decoded = _decode_signature(document["signature"], path, field="'signature'")
     return version, files, decoded, key_id
 
 
@@ -229,13 +268,17 @@ def diff_inventory(expected: list[dict], actual: list[dict]) -> tuple[list, list
 
 def _looks_like_manifest(document: dict) -> bool:
     keys = set(document)
-    if keys == set(V2_FIELDS) or keys == set(V1_FIELDS):
+    if keys in (set(V1_FIELDS), set(V2_FIELDS), set(V3_FIELDS)):
         return document.get("algorithm") == ALGORITHM
     return False
 
 
 def _looks_like_trust_store(document: dict) -> bool:
     return document.get("kind") == TRUST_STORE_KIND and "keys" in document
+
+
+def _looks_like_policy(document: dict) -> bool:
+    return set(document) == set(POLICY_FIELDS)
 
 
 def _read_nofollow(path: Path, max_bytes: int | None = None) -> bytes:
@@ -252,15 +295,19 @@ def _read_nofollow(path: Path, max_bytes: int | None = None) -> bytes:
 
 
 def reject_forbidden_files(directory: Path, files: list[dict]) -> None:
-    """Reject keys, manifests or trust stores placed inside the tree."""
+    """Reject keys, manifests, trust stores or policies inside the tree.
+
+    Detection is by content, not by name: an ordinary ``.pem`` or
+    ``.json`` file is deliverable, while a real PEM key block or a JSON
+    document structurally matching a manifest, trust store or policy is
+    refused whatever its file name.
+    """
     for record in files:
         rel = record["path"]
         path = directory / rel
         name = rel.rsplit("/", 1)[-1].lower()
         prefix = _read_nofollow(path, 256).lstrip()
-        if name.endswith(".pem") or (
-            prefix.startswith(b"-----BEGIN ") and b"KEY-----" in prefix[:80]
-        ):
+        if prefix.startswith(b"-----BEGIN ") and b"KEY-----" in prefix[:80]:
             raise SealError(f"keys must stay outside the delivery tree: {path}")
         if not name.endswith(".json"):
             continue
@@ -278,6 +325,10 @@ def reject_forbidden_files(directory: Path, files: list[dict]) -> None:
             raise SealError(
                 f"trust stores must stay outside the delivery tree: {path}"
             )
+        if _looks_like_policy(document):
+            raise SealError(
+                f"policies must stay outside the delivery tree: {path}"
+            )
 
 
 def guarded_inventory(directory: Path) -> list[dict]:
@@ -287,7 +338,8 @@ def guarded_inventory(directory: Path) -> list[dict]:
     ``(dev, ino)`` identity, sizes and nanosecond mtimes. Every content
     read (hashing and forbidden-file classification) happens between the
     two snapshots, so a swapped or modified file is always caught. The
-    tree is also refused if it contains keys, manifests or trust stores.
+    tree is also refused if it contains keys, manifests, trust stores
+    or policies.
     """
     before = stat_snapshot(directory)
     files = inventory(directory)
@@ -334,7 +386,9 @@ def publish_new(target: Path, data: bytes, *, hint: str = "manifest") -> None:
     The bytes land in a synced temp file in target's directory and are
     published with a single non-overwriting hard link. An existing
     target is left byte-for-byte untouched; on failure no temp file or
-    half-written target remains.
+    half-written target remains. If the directory sync after publishing
+    fails, the complete new target stays in place, the temp file is
+    removed and the error reports that durability is uncertain.
     """
     parent = target.parent
     tmp = _staged_temp(parent, hint, data)
@@ -351,7 +405,8 @@ def publish_new(target: Path, data: bytes, *, hint: str = "manifest") -> None:
             _sync_directory(parent)
         except OSError as error:
             raise SealError(
-                f"manifest published but directory sync failed: {target}: {error}"
+                f"manifest published but directory sync failed; durability "
+                f"is uncertain: {target}: {error}"
             ) from error
     finally:
         if not published:
@@ -362,7 +417,13 @@ def publish_new(target: Path, data: bytes, *, hint: str = "manifest") -> None:
 
 
 def publish_replace(target: Path, data: bytes, *, hint: str) -> None:
-    """Atomically replace target with synced data; clean up on failure."""
+    """Atomically replace target with synced data; clean up on failure.
+
+    A failure before the replace leaves the old content untouched. If
+    the directory sync after the replace fails, the complete new target
+    stays in place, the temp file is removed and the error reports that
+    durability is uncertain.
+    """
     parent = target.parent
     tmp = _staged_temp(parent, hint, data)
     replaced = False
@@ -376,7 +437,8 @@ def publish_replace(target: Path, data: bytes, *, hint: str) -> None:
             _sync_directory(parent)
         except OSError as error:
             raise SealError(
-                f"{target} published but directory sync failed: {error}"
+                f"{target} published but directory sync failed; durability "
+                f"is uncertain: {error}"
             ) from error
     finally:
         if not replaced:
@@ -404,6 +466,47 @@ def sign_directory(directory, private_key, manifest) -> dict:
         "signature": base64.b64encode(
             key.sign(canonical_payload(VERSION_CURRENT, key_id, files))
         ).decode("ascii"),
+    }
+    data = (json.dumps(document, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
+    publish_new(manifest, data)
+    return document
+
+
+def sign_multi_directory(directory, manifest, private_keys) -> dict:
+    """Sign the inventory of directory with several Ed25519 keys.
+
+    Emits a version 3 manifest whose ``signatures`` object maps each
+    signer's key id (sorted) to its Base64 signature; every key signs
+    the full canonical manifest excluding ``signatures``. The key list
+    must be non-empty and hold distinct Ed25519 keys; private keys are
+    only read, never copied anywhere. The manifest is published without
+    overwriting, exactly like ``sign``.
+    """
+    directory = Path(directory)
+    manifest = Path(manifest)
+    privates = [Path(private) for private in private_keys]
+    if not privates:
+        raise SealError("sign-multi needs at least one private key")
+    require_outside(directory, (manifest, *privates))
+    keys = [load_private_key(private) for private in privates]
+    key_ids: list[str] = []
+    for key in keys:
+        key_id = key_id_of(key.public_key())
+        if key_id in key_ids:
+            raise SealError(f"duplicate signing key: {key_id}")
+        key_ids.append(key_id)
+    files = guarded_inventory(directory)
+    payload = canonical_payload(VERSION_MULTI, None, files)
+    signatures = {
+        key_id: base64.b64encode(key.sign(payload)).decode("ascii")
+        for key_id, key in sorted(zip(key_ids, keys))
+    }
+    document = {
+        "version": VERSION_MULTI,
+        "algorithm": ALGORITHM,
+        "hash": HASH,
+        "files": files,
+        "signatures": signatures,
     }
     data = (json.dumps(document, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
     publish_new(manifest, data)
