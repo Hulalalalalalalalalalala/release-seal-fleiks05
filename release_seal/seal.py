@@ -2,9 +2,12 @@
 
 import base64
 import binascii
+import hashlib
 import json
 import os
 from pathlib import Path
+import stat
+import tempfile
 
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives.asymmetric.ed25519 import (
@@ -12,29 +15,47 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import (
     Ed25519PublicKey,
 )
 from cryptography.hazmat.primitives.serialization import (
+    Encoding,
+    PublicFormat,
     load_pem_private_key,
     load_pem_public_key,
 )
 
 from .inventory import inventory
 
-VERSION = 1
+VERSION = 2
 ALGORITHM = "Ed25519"
 HASH = "SHA-256"
-FIELDS = ("version", "algorithm", "hash", "files", "signature")
+FIELDS_V1 = ("version", "algorithm", "hash", "files", "signature")
+FIELDS_V2 = ("version", "algorithm", "hash", "files", "key_id", "signature")
+VERSIONED_FIELDS = {1: FIELDS_V1, 2: FIELDS_V2}
 
 
 class SealError(ValueError):
     """A user-facing failure: print the message and exit with status 2."""
 
 
-def _payload(files: list[dict]) -> bytes:
+def key_id_of(key: Ed25519PublicKey) -> str:
+    """Return the SHA-256 of the DER SubjectPublicKeyInfo as lowercase hex."""
+    der = key.public_bytes(Encoding.DER, PublicFormat.SubjectPublicKeyInfo)
+    return hashlib.sha256(der).hexdigest()
+
+
+def _valid_key_id(value: object) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) == 64
+        and all(char in "0123456789abcdef" for char in value)
+    )
+
+
+def _payload(document: dict) -> bytes:
     """Return the canonical UTF-8 JSON the signature covers.
 
-    The signed body holds version, algorithm, hash and files, with keys
-    sorted, no whitespace and no Unicode escaping.
+    The signed body holds every manifest field except the signature itself,
+    with keys sorted, no whitespace and no Unicode escaping.
     """
-    body = {"version": VERSION, "algorithm": ALGORITHM, "hash": HASH, "files": files}
+    body = {key: value for key, value in document.items() if key != "signature"}
     return json.dumps(
         body, ensure_ascii=False, sort_keys=True, separators=(",", ":")
     ).encode("utf-8")
@@ -45,7 +66,8 @@ def _require_outside(directory: Path, paths: tuple[Path, ...]) -> None:
     for path in paths:
         if path.resolve().is_relative_to(root):
             raise SealError(
-                f"keys and manifests must stay outside the delivery tree: {path}"
+                f"keys, manifests and trust stores must stay outside the "
+                f"delivery tree: {path}"
             )
 
 
@@ -79,9 +101,37 @@ def _load_public_key(path: Path) -> Ed25519PublicKey:
     return key
 
 
+def _snapshot(root: Path) -> dict:
+    """Record path, type, identity, size and mtime for every tree entry."""
+    def walk_error(error: OSError) -> None:
+        raise error
+
+    info = root.lstat()
+    entries = {".": ("dir", info.st_dev, info.st_ino)}
+    for current, subdirs, filenames in os.walk(root, onerror=walk_error):
+        for name in (*subdirs, *filenames):
+            path = Path(current) / name
+            info = path.lstat()
+            if stat.S_ISDIR(info.st_mode):
+                kind = "dir"
+            elif stat.S_ISREG(info.st_mode):
+                kind = "file"
+            else:
+                kind = "other"
+            entries[path.relative_to(root).as_posix()] = (
+                kind,
+                info.st_dev,
+                info.st_ino,
+                info.st_size,
+                info.st_mtime_ns,
+            )
+    return entries
+
+
 def _scan_unchanged(directory: Path) -> list[dict]:
+    before = _snapshot(directory)
     files = inventory(directory)
-    if inventory(directory) != files:
+    if _snapshot(directory) != before:
         raise SealError(f"directory changed while scanning: {directory}")
     return files
 
@@ -103,7 +153,7 @@ def _valid_record(record: object) -> bool:
     )
 
 
-def _load_manifest(path: Path) -> tuple[list[dict], bytes]:
+def _load_manifest(path: Path) -> tuple[dict, bytes]:
     try:
         raw = path.read_bytes()
     except OSError as error:
@@ -112,13 +162,21 @@ def _load_manifest(path: Path) -> tuple[list[dict], bytes]:
         document = json.loads(raw.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError) as error:
         raise SealError(f"manifest is not UTF-8 JSON: {path}: {error}") from error
-    if not isinstance(document, dict) or set(document) != set(FIELDS):
+    if not isinstance(document, dict):
+        raise SealError(f"manifest must be a JSON object: {path}")
+    version = document.get("version")
+    if (
+        not isinstance(version, int)
+        or isinstance(version, bool)
+        or version not in VERSIONED_FIELDS
+    ):
+        supported = ", ".join(str(v) for v in sorted(VERSIONED_FIELDS))
+        raise SealError(f"manifest field 'version' must be one of {supported}: {path}")
+    fields = VERSIONED_FIELDS[version]
+    if set(document) != set(fields):
         raise SealError(
-            f"manifest must contain exactly {', '.join(FIELDS)}: {path}"
+            f"manifest must contain exactly {', '.join(fields)}: {path}"
         )
-    version = document["version"]
-    if not isinstance(version, int) or isinstance(version, bool) or version != VERSION:
-        raise SealError(f"manifest field 'version' must be {VERSION}: {path}")
     if document["algorithm"] != ALGORITHM:
         raise SealError(f"manifest field 'algorithm' must be {ALGORITHM!r}: {path}")
     if document["hash"] != HASH:
@@ -129,6 +187,10 @@ def _load_manifest(path: Path) -> tuple[list[dict], bytes]:
     paths = [record["path"] for record in files]
     if len(set(paths)) != len(paths):
         raise SealError(f"manifest lists duplicate paths: {path}")
+    if version == 2 and not _valid_key_id(document["key_id"]):
+        raise SealError(
+            f"manifest field 'key_id' must be 64 lowercase hex characters: {path}"
+        )
     signature = document["signature"]
     if not isinstance(signature, str):
         raise SealError(f"manifest field 'signature' must be Base64 text: {path}")
@@ -138,7 +200,7 @@ def _load_manifest(path: Path) -> tuple[list[dict], bytes]:
         raise SealError(f"manifest signature is not Base64: {path}") from error
     if len(decoded) != 64:
         raise SealError(f"manifest signature must be 64 bytes: {path}")
-    return files, decoded
+    return document, decoded
 
 
 def _diff(expected: list[dict], actual: list[dict]) -> tuple[list, list, list]:
@@ -156,6 +218,42 @@ def _diff(expected: list[dict], actual: list[dict]) -> tuple[list, list, list]:
     return modified, missing, unexpected
 
 
+def _publish_exclusive(target: Path, data: bytes) -> None:
+    """Publish data at target exactly once, never overwriting, via a synced
+    temporary file in the same directory. Leaves no residue on failure."""
+    fd, temporary = tempfile.mkstemp(
+        prefix=target.name + ".", dir=str(target.parent)
+    )
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        try:
+            os.link(temporary, target)
+        except FileExistsError as error:
+            raise SealError(f"manifest already exists: {target}") from error
+        except OSError as error:
+            raise SealError(f"cannot publish manifest {target}: {error}") from error
+        try:
+            directory_fd = os.open(target.parent, os.O_RDONLY)
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+        except OSError:
+            pass
+    except SealError:
+        raise
+    except OSError as error:
+        raise SealError(f"cannot write manifest {target}: {error}") from error
+    finally:
+        try:
+            os.unlink(temporary)
+        except OSError:
+            pass
+
+
 def sign_directory(directory, private_key, manifest) -> dict:
     """Sign the inventory of directory and atomically create manifest."""
     directory = Path(directory)
@@ -169,21 +267,13 @@ def sign_directory(directory, private_key, manifest) -> dict:
         "algorithm": ALGORITHM,
         "hash": HASH,
         "files": files,
-        "signature": base64.b64encode(key.sign(_payload(files))).decode("ascii"),
+        "key_id": key_id_of(key.public_key()),
     }
+    document["signature"] = base64.b64encode(
+        key.sign(_payload(document))
+    ).decode("ascii")
     data = (json.dumps(document, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
-    try:
-        fd = os.open(manifest, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
-    except FileExistsError as error:
-        raise SealError(f"manifest already exists: {manifest}") from error
-    except OSError as error:
-        raise SealError(f"cannot create manifest {manifest}: {error}") from error
-    try:
-        with os.fdopen(fd, "wb") as output:
-            output.write(data)
-    except OSError as error:
-        manifest.unlink(missing_ok=True)
-        raise SealError(f"cannot write manifest {manifest}: {error}") from error
+    _publish_exclusive(manifest, data)
     return document
 
 
@@ -194,12 +284,14 @@ def verify_directory(directory, manifest, public_key) -> dict:
     public_key = Path(public_key)
     _require_outside(directory, (manifest, public_key))
     key = _load_public_key(public_key)
-    files, signature = _load_manifest(manifest)
+    document, signature = _load_manifest(manifest)
     try:
-        key.verify(signature, _payload(files))
+        key.verify(signature, _payload(document))
     except InvalidSignature:
         return {"valid": False, "modified": [], "missing": [], "unexpected": []}
-    modified, missing, unexpected = _diff(files, _scan_unchanged(directory))
+    modified, missing, unexpected = _diff(
+        document["files"], _scan_unchanged(directory)
+    )
     if modified or missing or unexpected:
         return {
             "valid": False,

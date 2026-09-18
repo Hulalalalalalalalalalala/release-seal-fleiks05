@@ -21,6 +21,7 @@ def demo() -> int:
     )
 
     from .seal import sign_directory, verify_directory
+    from .trust import import_key, revoke_key, verify_trusted
 
     package = Path(__file__).resolve().parent.parent / "examples" / "package"
     with tempfile.TemporaryDirectory(prefix="release-seal-demo-") as workspace:
@@ -37,16 +38,24 @@ def demo() -> int:
             key.public_key().public_bytes(Encoding.PEM, PublicFormat.SubjectPublicKeyInfo)
         )
         manifest = work / "manifest.json"
+        store = work / "trust-store.json"
         print("== inventory ==")
         print(json.dumps(inventory(delivery), ensure_ascii=False, indent=2))
         print("== sign ==")
-        print(json.dumps(
-            sign_directory(delivery, private_key, manifest),
-            ensure_ascii=False, indent=2,
-        ))
+        document = sign_directory(delivery, private_key, manifest)
+        print(json.dumps(document, ensure_ascii=False, indent=2))
         print("== verify: untouched delivery ==")
         print(json.dumps(
             verify_directory(delivery, manifest, public_key),
+            ensure_ascii=False, indent=2,
+        ))
+        print("== trust import ==")
+        print(json.dumps(
+            import_key(public_key, store), ensure_ascii=False, indent=2,
+        ))
+        print("== verify-trusted: untouched delivery ==")
+        print(json.dumps(
+            verify_trusted(delivery, manifest, store),
             ensure_ascii=False, indent=2,
         ))
         print("== verify: tampered delivery ==")
@@ -54,6 +63,16 @@ def demo() -> int:
         target.write_bytes(target.read_bytes() + b"tampered")
         print(json.dumps(
             verify_directory(delivery, manifest, public_key),
+            ensure_ascii=False, indent=2,
+        ))
+        print("== trust revoke ==")
+        print(json.dumps(
+            revoke_key(store, document["key_id"], "demo revocation"),
+            ensure_ascii=False, indent=2,
+        ))
+        print("== verify-trusted: revoked key ==")
+        print(json.dumps(
+            verify_trusted(delivery, manifest, store),
             ensure_ascii=False, indent=2,
         ))
         private_key.unlink()
@@ -83,6 +102,27 @@ def main() -> int:
     checking.add_argument("directory", help="directory to check")
     checking.add_argument("manifest", help="signed manifest to trust")
     checking.add_argument("public", help="PEM Ed25519 public key to trust")
+    trusted = commands.add_parser(
+        "verify-trusted", help="verify a manifest against the offline trust store"
+    )
+    trusted.add_argument("directory", help="directory to check")
+    trusted.add_argument("manifest", help="signed version 2 manifest to trust")
+    trusted.add_argument("store", help="trust store holding pinned public keys")
+    trust = commands.add_parser(
+        "trust", help="manage the offline public-key trust store"
+    )
+    trust_commands = trust.add_subparsers(dest="trust_command", required=True)
+    importing = trust_commands.add_parser(
+        "import", help="import a PEM Ed25519 public key into the store"
+    )
+    importing.add_argument("public", help="PEM Ed25519 public key to pin")
+    importing.add_argument("store", help="trust store to create or update")
+    revoking = trust_commands.add_parser(
+        "revoke", help="revoke a trusted key by its key id"
+    )
+    revoking.add_argument("store", help="trust store to update")
+    revoking.add_argument("key_id", help="64 lowercase hex characters")
+    revoking.add_argument("reason", nargs="?", help="optional revocation reason")
     commands.add_parser(
         "demo", help="demonstrate inventory, signing and verification"
     )
@@ -98,11 +138,24 @@ def main() -> int:
 
             result = sign_directory(args.directory, args.private, args.manifest)
             code = 0
-        else:
+        elif args.command == "verify":
             from .seal import verify_directory
 
             result = verify_directory(args.directory, args.manifest, args.public)
             code = 0 if result["valid"] else 1
+        elif args.command == "verify-trusted":
+            from .trust import verify_trusted
+
+            result = verify_trusted(args.directory, args.manifest, args.store)
+            code = 0 if result["valid"] else 1
+        else:
+            from . import trust as trust_store
+
+            if args.trust_command == "import":
+                result = trust_store.import_key(args.public, args.store)
+            else:
+                result = trust_store.revoke_key(args.store, args.key_id, args.reason)
+            code = 0
     except (OSError, ValueError) as error:
         print(f"release_seal: {error}", file=sys.stderr)
         return 2

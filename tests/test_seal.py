@@ -1,10 +1,12 @@
 import base64
+import hashlib
 import json
 from pathlib import Path
 import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from cryptography.hazmat.primitives.asymmetric.rsa import generate_private_key
@@ -13,10 +15,13 @@ from cryptography.hazmat.primitives.serialization import (
     NoEncryption,
     PrivateFormat,
     PublicFormat,
+    load_pem_private_key,
     load_pem_public_key,
 )
 
-from release_seal.seal import SealError, sign_directory, verify_directory
+from release_seal import seal
+from release_seal.inventory import inventory
+from release_seal.seal import SealError, key_id_of, sign_directory, verify_directory
 
 
 def write_keypair(work: Path) -> tuple[Path, Path]:
@@ -58,34 +63,49 @@ class SealTestCase(unittest.TestCase):
 
 
 class SignTests(SealTestCase):
-    def test_sign_writes_signed_manifest(self):
+    def test_sign_writes_signed_version_2_manifest(self):
         document = sign_directory(self.delivery, self.private, self.manifest)
-        self.assertEqual(document["version"], 1)
+        self.assertEqual(document["version"], 2)
         self.assertEqual(document["algorithm"], "Ed25519")
         self.assertEqual(document["hash"], "SHA-256")
         self.assertEqual(
             [record["path"] for record in document["files"]],
             ["café.txt", "docs/readme.txt"],
         )
+        der = load_pem_public_key(self.public.read_bytes()).public_bytes(
+            Encoding.DER, PublicFormat.SubjectPublicKeyInfo
+        )
+        self.assertEqual(document["key_id"], hashlib.sha256(der).hexdigest())
         signature = base64.b64decode(document["signature"], validate=True)
         self.assertEqual(len(signature), 64)
         on_disk = json.loads(self.manifest.read_text(encoding="utf-8"))
         self.assertEqual(on_disk, document)
 
-    def test_signature_covers_canonical_payload(self):
+    def test_signature_covers_everything_but_signature(self):
         document = sign_directory(self.delivery, self.private, self.manifest)
         payload = json.dumps(
             {
-                "version": 1,
+                "version": 2,
                 "algorithm": "Ed25519",
                 "hash": "SHA-256",
                 "files": document["files"],
+                "key_id": document["key_id"],
             },
             ensure_ascii=False, sort_keys=True, separators=(",", ":"),
         ).encode("utf-8")
         self.assertIn("café".encode("utf-8"), payload)
         key = load_pem_public_key(self.public.read_bytes())
         key.verify(base64.b64decode(document["signature"]), payload)
+
+    def test_tampered_key_id_invalidates_signature(self):
+        document = sign_directory(self.delivery, self.private, self.manifest)
+        document["key_id"] = "0" * 64
+        self.manifest.write_text(
+            json.dumps(document, ensure_ascii=False), encoding="utf-8"
+        )
+        self.assertEqual(verify_directory(self.delivery, self.manifest, self.public), {
+            "valid": False, "modified": [], "missing": [], "unexpected": [],
+        })
 
     def test_sign_refuses_to_overwrite_manifest(self):
         sign_directory(self.delivery, self.private, self.manifest)
@@ -94,6 +114,29 @@ class SignTests(SealTestCase):
         result = run_cli("sign", self.delivery, self.private, self.manifest)
         self.assertEqual(result.returncode, 2)
         self.assertIn("already exists", result.stderr)
+
+    def test_sign_leaves_existing_manifest_untouched_and_no_residue(self):
+        self.manifest.write_bytes(b"keep me")
+        with self.assertRaises(SealError):
+            sign_directory(self.delivery, self.private, self.manifest)
+        self.assertEqual(self.manifest.read_bytes(), b"keep me")
+        leftovers = [
+            path for path in self.work.iterdir()
+            if path.name.startswith(self.manifest.name + ".")
+        ]
+        self.assertEqual(leftovers, [])
+
+    def test_sign_refuses_when_directory_changes_mid_scan(self):
+        original = seal.inventory
+
+        def mutating(directory):
+            (self.delivery / "mid-scan.txt").write_bytes(b"sneaky")
+            return original(directory)
+
+        with mock.patch.object(seal, "inventory", mutating):
+            with self.assertRaises(SealError):
+                sign_directory(self.delivery, self.private, self.manifest)
+        self.assertFalse(self.manifest.exists())
 
     def test_sign_refuses_key_or_manifest_inside_delivery(self):
         cases = (
@@ -136,6 +179,27 @@ class VerifyTests(SealTestCase):
         result = run_cli("verify", self.delivery, self.manifest, self.public)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(json.loads(result.stdout), {"valid": True})
+
+    def test_version_1_manifest_still_verifies(self):
+        files = inventory(self.delivery)
+        body = {
+            "version": 1,
+            "algorithm": "Ed25519",
+            "hash": "SHA-256",
+            "files": files,
+        }
+        payload = json.dumps(
+            body, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
+        key = load_pem_private_key(self.private.read_bytes(), password=None)
+        document = {
+            **body,
+            "signature": base64.b64encode(key.sign(payload)).decode("ascii"),
+        }
+        self.manifest.write_text(
+            json.dumps(document, ensure_ascii=False), encoding="utf-8"
+        )
+        self.assertEqual(self.verify(), {"valid": True})
 
     def test_modified_file(self):
         (self.delivery / "docs" / "readme.txt").write_bytes(b"changed")
@@ -196,9 +260,16 @@ class VerifyTests(SealTestCase):
         self.assertEqual(result.returncode, 2)
         self.assertNotEqual(result.stderr, "")
 
-    def test_manifest_with_wrong_version_is_a_format_error(self):
+    def test_manifest_with_unsupported_version_is_a_format_error(self):
         document = json.loads(self.manifest.read_text(encoding="utf-8"))
-        document["version"] = 2
+        document["version"] = 3
+        self.manifest.write_text(json.dumps(document), encoding="utf-8")
+        with self.assertRaises(SealError):
+            self.verify()
+
+    def test_version_2_manifest_without_key_id_is_a_format_error(self):
+        document = json.loads(self.manifest.read_text(encoding="utf-8"))
+        del document["key_id"]
         self.manifest.write_text(json.dumps(document), encoding="utf-8")
         with self.assertRaises(SealError):
             self.verify()
@@ -217,12 +288,20 @@ class VerifyTests(SealTestCase):
             verify_directory(self.delivery, self.manifest, self.delivery / "public.pem")
 
 
+class KeyIdTests(unittest.TestCase):
+    def test_key_id_is_sha256_of_der_subject_public_key_info(self):
+        key = Ed25519PrivateKey.generate().public_key()
+        der = key.public_bytes(Encoding.DER, PublicFormat.SubjectPublicKeyInfo)
+        self.assertEqual(key_id_of(key), hashlib.sha256(der).hexdigest())
+
+
 class DemoTests(unittest.TestCase):
     def test_demo_signs_verifies_and_rejects_tampering(self):
         result = run_cli("demo")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn('"valid": true', result.stdout)
         self.assertIn('"valid": false', result.stdout)
+        self.assertIn('"reason": "revoked"', result.stdout)
         self.assertIn("private key has been removed", result.stdout)
 
 
