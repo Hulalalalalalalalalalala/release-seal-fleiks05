@@ -83,6 +83,28 @@ def main() -> int:
     checking.add_argument("directory", help="directory to check")
     checking.add_argument("manifest", help="signed manifest to trust")
     checking.add_argument("public", help="PEM Ed25519 public key to trust")
+    trusted = commands.add_parser(
+        "verify-trusted",
+        help="verify a manifest using keys in an offline trust store",
+    )
+    trusted.add_argument("directory", help="directory to check")
+    trusted.add_argument("manifest", help="signed manifest to verify")
+    trusted.add_argument("store", help="versioned trust store JSON file")
+    trust = commands.add_parser(
+        "trust", help="manage the offline public-key trust store"
+    )
+    trust_commands = trust.add_subparsers(dest="trust_command", required=True)
+    importing = trust_commands.add_parser(
+        "import", help="import a PEM Ed25519 public key"
+    )
+    importing.add_argument("public", help="PEM Ed25519 public key to trust")
+    importing.add_argument("store", help="trust store JSON file (created if absent)")
+    revoking = trust_commands.add_parser(
+        "revoke", help="revoke an imported key by key id"
+    )
+    revoking.add_argument("store", help="trust store JSON file")
+    revoking.add_argument("key_id", help="SHA-256 hex id of the key to revoke")
+    revoking.add_argument("reason", nargs="?", help="optional revocation reason")
     commands.add_parser(
         "demo", help="demonstrate inventory, signing and verification"
     )
@@ -98,11 +120,27 @@ def main() -> int:
 
             result = sign_directory(args.directory, args.private, args.manifest)
             code = 0
-        else:
+        elif args.command == "verify":
             from .seal import verify_directory
 
             result = verify_directory(args.directory, args.manifest, args.public)
             code = 0 if result["valid"] else 1
+        elif args.command == "verify-trusted":
+            from .trust import verify_trusted
+
+            result = verify_trusted(args.directory, args.manifest, args.store)
+            code = 0 if result["valid"] else 1
+        elif args.command == "trust":
+            from .trust import import_key, revoke_key
+
+            if args.trust_command == "import":
+                result = import_key(args.public, args.store)
+            else:
+                result = revoke_key(args.store, args.key_id, args.reason)
+            code = 0
+        else:  # pragma: no cover - argparse rejects unknown commands
+            parser.error(f"unknown command: {args.command}")
+            return 2
     except (OSError, ValueError) as error:
         print(f"release_seal: {error}", file=sys.stderr)
         return 2

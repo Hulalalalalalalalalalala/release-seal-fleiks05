@@ -1,5 +1,7 @@
 import base64
+import hashlib
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -13,9 +15,11 @@ from cryptography.hazmat.primitives.serialization import (
     NoEncryption,
     PrivateFormat,
     PublicFormat,
+    load_pem_private_key,
     load_pem_public_key,
 )
 
+from release_seal.inventory import inventory, stat_snapshot
 from release_seal.seal import SealError, sign_directory, verify_directory
 
 
@@ -60,13 +64,16 @@ class SealTestCase(unittest.TestCase):
 class SignTests(SealTestCase):
     def test_sign_writes_signed_manifest(self):
         document = sign_directory(self.delivery, self.private, self.manifest)
-        self.assertEqual(document["version"], 1)
+        self.assertEqual(document["version"], 2)
         self.assertEqual(document["algorithm"], "Ed25519")
         self.assertEqual(document["hash"], "SHA-256")
         self.assertEqual(
             [record["path"] for record in document["files"]],
             ["café.txt", "docs/readme.txt"],
         )
+        key = load_pem_public_key(self.public.read_bytes())
+        der = key.public_bytes(Encoding.DER, PublicFormat.SubjectPublicKeyInfo)
+        self.assertEqual(document["key_id"], hashlib.sha256(der).hexdigest())
         signature = base64.b64decode(document["signature"], validate=True)
         self.assertEqual(len(signature), 64)
         on_disk = json.loads(self.manifest.read_text(encoding="utf-8"))
@@ -76,9 +83,10 @@ class SignTests(SealTestCase):
         document = sign_directory(self.delivery, self.private, self.manifest)
         payload = json.dumps(
             {
-                "version": 1,
+                "version": 2,
                 "algorithm": "Ed25519",
                 "hash": "SHA-256",
+                "key_id": document["key_id"],
                 "files": document["files"],
             },
             ensure_ascii=False, sort_keys=True, separators=(",", ":"),
@@ -121,6 +129,91 @@ class SignTests(SealTestCase):
         )
         self.assertEqual(result.returncode, 2)
         self.assertNotEqual(result.stderr, "")
+
+    def test_failed_sign_leaves_no_residue(self):
+        rsa = self.work / "rsa.pem"
+        rsa.write_bytes(
+            generate_private_key(public_exponent=65537, key_size=2048).private_bytes(
+                Encoding.PEM, PrivateFormat.PKCS8, NoEncryption()
+            )
+        )
+        with self.assertRaises(SealError):
+            sign_directory(self.delivery, rsa, self.manifest)
+        self.assertFalse(self.manifest.exists())
+        self.assertEqual(
+            [p.name for p in self.work.iterdir() if p.name.startswith(".")],
+            [],
+        )
+
+    def test_existing_manifest_is_never_overwritten_or_truncated(self):
+        sign_directory(self.delivery, self.private, self.manifest)
+        original = self.manifest.read_bytes()
+        with self.assertRaises(SealError):
+            sign_directory(self.delivery, self.private, self.manifest)
+        self.assertEqual(self.manifest.read_bytes(), original)
+        self.assertEqual(
+            [p.name for p in self.work.iterdir() if p.suffix == ".tmp"],
+            [],
+        )
+
+    def test_sign_rejects_keys_and_manifests_inside_tree(self):
+        public_in_tree = self.delivery / "embedded.pem"
+        public_in_tree.write_bytes(self.public.read_bytes())
+        with self.assertRaises(SealError):
+            sign_directory(self.delivery, self.private, self.manifest)
+        public_in_tree.unlink()
+        manifest_in_tree = self.delivery / "embedded-manifest.json"
+        sign_directory(self.delivery, self.private, self.manifest)
+        manifest_in_tree.write_bytes(self.manifest.read_bytes())
+        second = self.work / "second.json"
+        with self.assertRaises(SealError):
+            sign_directory(self.delivery, self.private, second)
+
+    def test_sign_rejects_directory_whose_mtime_changes_mid_scan(self):
+        # Touching a file updates its mtime: the before/after identity
+        # snapshots must disagree and force a status-2 failure.
+        from release_seal import seal as seal_module
+
+        target = self.delivery / "notes-touch.txt"
+        target.write_bytes(b"x")
+        original = seal_module.inventory
+        calls = {"n": 0}
+
+        def racing(directory):
+            result = original(directory)
+            calls["n"] += 1
+            if calls["n"] == 1:
+                target.write_bytes(b"xy")
+            return result
+
+        seal_module.inventory = racing
+        try:
+            with self.assertRaises(SealError):
+                sign_directory(self.delivery, self.private, self.manifest)
+        finally:
+            seal_module.inventory = original
+        self.assertFalse(self.manifest.exists())
+
+    def test_stat_snapshot_detects_inode_replacement(self):
+        other = self.work / "replacement-source"
+        other.write_bytes(b"other")
+        target = self.delivery / "docs" / "readme.txt"
+        before = stat_snapshot(self.delivery)
+        os.replace(other, target)
+        after = stat_snapshot(self.delivery)
+        self.assertNotEqual(before, after)
+
+    def test_stat_snapshot_rejects_symlinks_and_special_files(self):
+        target = self.work / "outside"
+        target.write_bytes(b"x")
+        link = self.delivery / "loop"
+        link.symlink_to(target)
+        try:
+            with self.assertRaises(ValueError):
+                stat_snapshot(self.delivery)
+        finally:
+            link.unlink()
+        self.assertEqual(stat_snapshot(self.delivery)["."][0], "dir")
 
 
 class VerifyTests(SealTestCase):
@@ -196,12 +289,75 @@ class VerifyTests(SealTestCase):
         self.assertEqual(result.returncode, 2)
         self.assertNotEqual(result.stderr, "")
 
-    def test_manifest_with_wrong_version_is_a_format_error(self):
+    def test_manifest_with_unknown_version_is_a_format_error(self):
         document = json.loads(self.manifest.read_text(encoding="utf-8"))
-        document["version"] = 2
+        document["version"] = 3
         self.manifest.write_text(json.dumps(document), encoding="utf-8")
         with self.assertRaises(SealError):
             self.verify()
+        result = run_cli("verify", self.delivery, self.manifest, self.public)
+        self.assertEqual(result.returncode, 2)
+        self.assertNotEqual(result.stderr, "")
+
+    def test_version_1_manifest_is_still_accepted(self):
+        files = inventory(self.delivery)
+        key = load_pem_public_key(self.public.read_bytes())
+        private_key = load_pem_private_key(self.private.read_bytes(), password=None)
+        payload = json.dumps(
+            {
+                "version": 1,
+                "algorithm": "Ed25519",
+                "hash": "SHA-256",
+                "files": files,
+            },
+            ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+        ).encode("utf-8")
+        v1 = {
+            "version": 1,
+            "algorithm": "Ed25519",
+            "hash": "SHA-256",
+            "files": files,
+            "signature": base64.b64encode(private_key.sign(payload)).decode("ascii"),
+        }
+        self.manifest.write_text(json.dumps(v1), encoding="utf-8")
+        self.assertEqual(self.verify(), {"valid": True})
+        result = run_cli("verify", self.delivery, self.manifest, self.public)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout), {"valid": True})
+
+    def test_key_id_mismatch_fails_without_trusting_any_key(self):
+        document = json.loads(self.manifest.read_text(encoding="utf-8"))
+        other_dir = self.work / "other"
+        other_dir.mkdir()
+        other_private, other_public = write_keypair(other_dir)
+        other_key = load_pem_private_key(
+            other_private.read_bytes(), password=None
+        )
+        other_id = hashlib.sha256(
+            load_pem_public_key(other_public.read_bytes()).public_bytes(
+                Encoding.DER, PublicFormat.SubjectPublicKeyInfo
+            )
+        ).hexdigest()
+        document["key_id"] = other_id
+        payload = json.dumps(
+            {
+                "version": 2,
+                "algorithm": "Ed25519",
+                "hash": "SHA-256",
+                "key_id": other_id,
+                "files": document["files"],
+            },
+            ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+        ).encode("utf-8")
+        document["signature"] = base64.b64encode(
+            other_key.sign(payload)
+        ).decode("ascii")
+        # Signed by the other key but verified against the original key:
+        # key_id mismatch alone must already force failure.
+        self.manifest.write_text(json.dumps(document), encoding="utf-8")
+        self.assertEqual(self.verify(), {
+            "valid": False, "modified": [], "missing": [], "unexpected": [],
+        })
 
     def test_unparseable_public_key_is_a_format_error(self):
         self.public.write_bytes(b"not a pem")
