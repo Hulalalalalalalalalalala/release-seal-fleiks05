@@ -3,32 +3,111 @@
 import argparse
 import json
 from pathlib import Path
+import shutil
 import sys
+import tempfile
 
 from .inventory import inventory
 
 
+def demo() -> int:
+    """Sign and verify a copy of the example package with a throwaway key."""
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+    from cryptography.hazmat.primitives.serialization import (
+        Encoding,
+        NoEncryption,
+        PrivateFormat,
+        PublicFormat,
+    )
+
+    from .seal import sign_directory, verify_directory
+
+    package = Path(__file__).resolve().parent.parent / "examples" / "package"
+    with tempfile.TemporaryDirectory(prefix="release-seal-demo-") as workspace:
+        work = Path(workspace)
+        delivery = work / "package"
+        shutil.copytree(package, delivery)
+        key = Ed25519PrivateKey.generate()
+        private_key = work / "demo-private.pem"
+        public_key = work / "demo-public.pem"
+        private_key.write_bytes(
+            key.private_bytes(Encoding.PEM, PrivateFormat.PKCS8, NoEncryption())
+        )
+        public_key.write_bytes(
+            key.public_key().public_bytes(Encoding.PEM, PublicFormat.SubjectPublicKeyInfo)
+        )
+        manifest = work / "manifest.json"
+        print("== inventory ==")
+        print(json.dumps(inventory(delivery), ensure_ascii=False, indent=2))
+        print("== sign ==")
+        print(json.dumps(
+            sign_directory(delivery, private_key, manifest),
+            ensure_ascii=False, indent=2,
+        ))
+        print("== verify: untouched delivery ==")
+        print(json.dumps(
+            verify_directory(delivery, manifest, public_key),
+            ensure_ascii=False, indent=2,
+        ))
+        print("== verify: tampered delivery ==")
+        target = delivery / "notes.txt"
+        target.write_bytes(target.read_bytes() + b"tampered")
+        print(json.dumps(
+            verify_directory(delivery, manifest, public_key),
+            ensure_ascii=False, indent=2,
+        ))
+        private_key.unlink()
+    print("demo finished; the temporary private key has been removed")
+    return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
-        prog="release_seal", description="Create an inventory of a local directory."
+        prog="release_seal",
+        description="Inventory, sign and verify a local delivery directory.",
     )
     commands = parser.add_subparsers(dest="command", required=True)
-    listing = commands.add_parser("inventory", help="list ordinary files and SHA-256 hashes")
+    listing = commands.add_parser(
+        "inventory", help="list ordinary files and SHA-256 hashes"
+    )
     listing.add_argument("directory", help="directory to read")
-    commands.add_parser("demo", help="show the inventory of the bundled example package")
+    signing = commands.add_parser(
+        "sign", help="sign the inventory with an Ed25519 private key"
+    )
+    signing.add_argument("directory", help="directory to read")
+    signing.add_argument("private", help="PEM Ed25519 private key (read only)")
+    signing.add_argument("manifest", help="manifest to create; must not exist yet")
+    checking = commands.add_parser(
+        "verify", help="verify a signed manifest against a directory"
+    )
+    checking.add_argument("directory", help="directory to check")
+    checking.add_argument("manifest", help="signed manifest to trust")
+    checking.add_argument("public", help="PEM Ed25519 public key to trust")
+    commands.add_parser(
+        "demo", help="demonstrate inventory, signing and verification"
+    )
     args = parser.parse_args()
     try:
-        directory = (
-            Path(__file__).resolve().parent.parent / "examples" / "package"
-            if args.command == "demo"
-            else args.directory
-        )
-        result = inventory(directory)
+        if args.command == "demo":
+            return demo()
+        if args.command == "inventory":
+            result = inventory(args.directory)
+            code = 0
+        elif args.command == "sign":
+            from .seal import sign_directory
+
+            result = sign_directory(args.directory, args.private, args.manifest)
+            code = 0
+        else:
+            from .seal import verify_directory
+
+            result = verify_directory(args.directory, args.manifest, args.public)
+            code = 0 if result["valid"] else 1
     except (OSError, ValueError) as error:
         print(f"release_seal: {error}", file=sys.stderr)
         return 2
     print(json.dumps(result, ensure_ascii=False, indent=2))
-    return 0
+    return code
 
 
 if __name__ == "__main__":
