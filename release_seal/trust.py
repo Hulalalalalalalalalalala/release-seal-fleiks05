@@ -20,6 +20,7 @@ from cryptography.hazmat.primitives.serialization import (
 from .seal import (
     ALGORITHM,
     TRUST_STORE_KIND,
+    VERSION_MULTI,
     SealError,
     canonical_payload,
     decode_public_key,
@@ -238,6 +239,11 @@ def verify_trusted(directory, manifest_path, store_path) -> dict:
     require_outside(directory, (manifest_path, store_path))
     document = load_store(store_path)
     version, files, signature, key_id = load_manifest(manifest_path)
+    if version == VERSION_MULTI:
+        raise SealError(
+            f"version {VERSION_MULTI} multisig manifests require a threshold "
+            f"policy; use verify-policy: {manifest_path}"
+        )
     keys = document["keys"]
 
     if version == 2:
