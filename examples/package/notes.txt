@@ -1,0 +1,2 @@
+Example delivery package.
+This directory contains public demonstration data.
