@@ -50,6 +50,11 @@ def load_batch(path: Path) -> list[dict]:
         raw = path.read_bytes()
     except OSError as error:
         raise SealError(f"cannot read batch {path}: {error}") from error
+    return parse_batch(raw, path)
+
+
+def parse_batch(raw: bytes, path: Path) -> list[dict]:
+    """Validate raw BATCH bytes exactly like :func:`load_batch` does."""
     try:
         document = json.loads(raw.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError) as error:
@@ -97,6 +102,44 @@ def load_batch(path: Path) -> list[dict]:
     return items
 
 
+ERROR_KINDS = ("input", "io", "unsafe", "changed", "internal")
+OUTCOMES = {0: "passed", 1: "failed", 2: "error"}
+
+
+def classify_error(error: Exception) -> str:
+    """Map a per-item failure to a stable ``error_kind``.
+
+    * ``changed`` — the delivery tree changed while it was being scanned;
+    * ``unsafe`` — a safety restriction was violated (support files or
+      forbidden content inside the delivery tree, links or special
+      files in the tree);
+    * ``io`` — the failure wraps an :class:`OSError` (unreadable or
+      missing files, failed stats);
+    * ``input`` — any other recognized input problem (malformed keys,
+      manifests, stores, policies or arguments);
+    * ``internal`` — anything unexpected.
+    """
+    message = str(error)
+    if "changed while scanning" in message:
+        return "changed"
+    if (
+        "outside the delivery tree" in message
+        or "symbolic links are not supported" in message
+        or "expected an ordinary file" in message
+    ):
+        return "unsafe"
+    cause: BaseException | None = error
+    while cause is not None:
+        if isinstance(cause, OSError):
+            return "io"
+        cause = cause.__cause__
+    if isinstance(error, ValueError):
+        # SealError and the inventory's ValueError reports are all
+        # user-facing input problems once the cases above are excluded.
+        return "input"
+    return "internal"
+
+
 def _run_item(command: str, args: list[Path]) -> dict:
     if command == "verify":
         from .seal import verify_directory
@@ -109,6 +152,60 @@ def _run_item(command: str, args: list[Path]) -> dict:
     from .policy import verify_policy
 
     return verify_policy(args[0], args[1], args[2], args[3])
+
+
+def execute_items(items: list[dict], base: Path, batch_path: Path) -> list[dict]:
+    """Run every item in input order, returning rich per-item entries.
+
+    Each entry holds ``id``, ``command`` and ``code`` (0 for a valid
+    result, 1 for an invalid one, 2 when running the item raised). Codes
+    0/1 add the command's original ``result``; code 2 adds a non-empty
+    ``error`` string and a stable ``error_kind``. Item failures never
+    propagate and nothing is written to standard error.
+    """
+    entries: list[dict] = []
+    for item in items:
+        resolved = [base / value for value in item["args"]]
+        entry: dict = {"id": item["id"], "command": item["command"]}
+        try:
+            # The BATCH file itself must not live inside a delivery tree;
+            # each command additionally enforces its own outside-tree
+            # rules, O_NOFOLLOW reads and snapshot protection.
+            require_outside(resolved[0], (batch_path,))
+            result = _run_item(item["command"], resolved)
+            entry["code"] = 0 if result.get("valid") is True else 1
+            entry["result"] = result
+        except Exception as error:
+            # Once the BATCH is structurally valid, any per-item failure is
+            # a code-2 item result, never a command-level abort: the run
+            # still reports every item and writes nothing to stderr.
+            entry["code"] = 2
+            entry["error"] = str(error) or type(error).__name__
+            entry["error_kind"] = classify_error(error)
+        entries.append(entry)
+    return entries
+
+
+def summarize(entries: list[dict]) -> dict:
+    """Count entry codes into a ``total``/``passed``/``failed``/``errors`` summary."""
+    passed = sum(1 for entry in entries if entry["code"] == 0)
+    failed = sum(1 for entry in entries if entry["code"] == 1)
+    errors = sum(1 for entry in entries if entry["code"] == 2)
+    return {
+        "total": len(entries),
+        "passed": passed,
+        "failed": failed,
+        "errors": errors,
+    }
+
+
+def batch_exit_code(summary: dict) -> int:
+    """2 if any item errored, else 1 if any failed, else 0."""
+    if summary["errors"]:
+        return 2
+    if summary["failed"]:
+        return 1
+    return 0
 
 
 def verify_batch(batch_path) -> tuple[int, dict]:
@@ -128,48 +225,20 @@ def verify_batch(batch_path) -> tuple[int, dict]:
     batch_path = Path(batch_path)
     items = load_batch(batch_path)
     base = batch_path.resolve().parent
+    entries = execute_items(items, base, batch_path)
     results: list[dict] = []
-    passed = failed = errors = 0
-    for item in items:
-        resolved = [base / value for value in item["args"]]
-        entry: dict = {"id": item["id"]}
-        try:
-            # The BATCH file itself must not live inside a delivery tree;
-            # each command additionally enforces its own outside-tree
-            # rules, O_NOFOLLOW reads and snapshot protection.
-            require_outside(resolved[0], (batch_path,))
-            result = _run_item(item["command"], resolved)
-            if result.get("valid") is True:
-                entry["code"] = 0
-                passed += 1
-            else:
-                entry["code"] = 1
-                failed += 1
-            entry["result"] = result
-        except Exception as error:
-            # Once the BATCH is structurally valid, any per-item failure is
-            # a code-2 item result, never a command-level abort: the run
-            # still reports every item and writes nothing to stderr.
-            entry["code"] = 2
-            entry["error"] = str(error) or type(error).__name__
-            errors += 1
-        results.append(entry)
-    total = len(items)
+    for entry in entries:
+        projected: dict = {"id": entry["id"], "code": entry["code"]}
+        if entry["code"] == 2:
+            projected["error"] = entry["error"]
+        else:
+            projected["result"] = entry["result"]
+        results.append(projected)
+    summary = summarize(entries)
     report = {
         "version": BATCH_VERSION,
-        "valid": passed == total,
-        "summary": {
-            "total": total,
-            "passed": passed,
-            "failed": failed,
-            "errors": errors,
-        },
+        "valid": summary["passed"] == summary["total"],
+        "summary": summary,
         "results": results,
     }
-    if errors:
-        exit_code = 2
-    elif failed:
-        exit_code = 1
-    else:
-        exit_code = 0
-    return exit_code, report
+    return batch_exit_code(summary), report
