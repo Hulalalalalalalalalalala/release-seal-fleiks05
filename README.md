@@ -1,6 +1,6 @@
 # Release Seal
 
-为本地文件交付目录生成可读的文件清单，并用 Ed25519 签名实现可信的离线交付。需要 Python 3.10 或更高版本；`inventory` 仅依赖标准库，`sign`、`sign-multi`、`verify`、`trust`、`verify-trusted`、`verify-policy`、`verify-batch` 和 `demo` 需要 `cryptography` 包。
+为本地文件交付目录生成可读的文件清单，并用 Ed25519 签名实现可信的离线交付。需要 Python 3.10 或更高版本；`inventory` 仅依赖标准库，`sign`、`sign-multi`、`verify`、`trust`、`verify-trusted`、`verify-policy`、`verify-batch`、`audit-batch` 和 `demo` 需要 `cryptography` 包。
 
 ```sh
 python3 -m release_seal --help
@@ -13,6 +13,7 @@ python3 -m release_seal trust revoke trust.json KEY_ID "key compromised"
 python3 -m release_seal verify-trusted examples/package manifest.json trust.json
 python3 -m release_seal verify-policy examples/package manifest.json trust.json policy.json
 python3 -m release_seal verify-batch batch.json
+python3 -m release_seal audit-batch batch.json audit-report.json
 python3 -m release_seal demo
 python3 -m unittest discover -s tests -v
 ```
@@ -92,12 +93,20 @@ python3 -m unittest discover -s tests -v
 
 返回码：任一项为 2 则返回 2；否则任一项为 1 则返回 1；全部为 0 则返回 0。空数组合法，返回 0 且 `valid:true`。
 
+### audit-batch BATCH REPORT：离线审计报告
+
+`audit-batch BATCH REPORT` 按 `verify-batch` 完全相同的规则执行 BATCH——格式、相对路径基准（BATCH 文件所在目录）、输入顺序、目录限制和返回码都一致，空数组同样合法——并额外把一份不可变的审计报告发布到 REPORT。BATCH 结构错误时原因写标准错误、返回 2、**不创建报告**。
+
+REPORT 是 UTF-8 JSON，恰好包含六个字段：`kind`（`"release-seal-audit-report"`）、`version`（`1`）、`batch_sha256`（BATCH 文件原始字节的 SHA-256 小写十六进制）、`valid` 与 `summary`（含义同批量报告）以及 `results`。`results` 按输入顺序排列，每项含 `id`、`command`、`code` 和 `outcome`（0/1/2 分别对应 `passed`/`failed`/`error`）；`code` 为 0 或 1 时附原命令的 `result`，为 2 时附非空的 `error` 和稳定的 `error_kind`（限 `input`、`io`、`unsafe`、`changed`、`internal`）。报告绝不记录各项的 `args`、密钥材料、签名或 traceback。
+
+REPORT 必须位于每个交付树之外且绝不覆盖已有文件：字节先写入同目录的隐藏临时文件并 `fsync`，再通过一次不覆盖的硬链接发布，最后 `fsync` 目录。发布前失败无任何残留；发布后若目录 `fsync` 失败，完整报告保留在原位、临时文件被清理、返回 2 并提示耐久性不确定。成功后标准输出打印该报告，退出码沿用批量结果。树内的合法审计报告与清单、信任库、策略一样按内容拒绝；形似的无效 JSON 仍可交付。
+
 ## 扫描一致性与目录限制
 
-所有命令沿用相同的目录限制：输入必须是目录，目录树不支持符号链接和特殊文件（读取文件时使用 `O_NOFOLLOW`，防止检查后被换成符号链接）。私钥、公钥、清单、信任库、策略和 BATCH 文件不得位于交付目录内——既包括命令行参数，也包括盘点时在交付树中发现的同类文件。树内识别**只看内容、不看文件名或扩展名**。
+所有命令沿用相同的目录限制：输入必须是目录，目录树不支持符号链接和特殊文件（读取文件时使用 `O_NOFOLLOW`，防止检查后被换成符号链接）。私钥、公钥、清单、信任库、策略、BATCH 文件和审计报告不得位于交付目录内——既包括命令行参数，也包括盘点时在交付树中发现的同类文件。树内识别**只看内容、不看文件名或扩展名**。
 
 - **密钥（PEM）**：文件内容依次尝试 `load_pem_public_key` 与 `load_pem_private_key(password=None)`；任意算法（Ed25519、RSA、EC 等）只要其中一个加载成功，或者私钥加载明确报告"加密私钥缺少密码"，都判定为真实密钥而拒绝。证书（`CERTIFICATE`）、普通文本、畸形 PEM 装甲不是密钥，可以交付。DER、OpenSSH 与 PKCS#12 不做检查，一律可以交付。
-- **JSON 文档**：只有能被**完整校验通过**的文档才被拒绝——版本 1/2/3 清单、版本 1 信任库，或恰好三字段的版本 1 策略。字段名相似但取值非法（如签名长度不对、版本号不符、算法不符、阈值非法、多/少字段、`kind` 不符等）的"形似"文档**可以交付**。无法解析为 UTF-8 JSON 的字节也可以交付。扩展名不限：真实文档无论叫什么名字都拒绝，形似对象即使叫 `.json` 也放行。
+- **JSON 文档**：只有能被**完整校验通过**的文档才被拒绝——版本 1/2/3 清单、版本 1 信任库、恰好三字段的版本 1 策略，或版本 1 审计报告。字段名相似但取值非法（如签名长度不对、版本号不符、算法不符、阈值非法、多/少字段、`kind` 不符等）的"形似"文档**可以交付**。无法解析为 UTF-8 JSON 的字节也可以交付。扩展名不限：真实文档无论叫什么名字都拒绝，形似对象即使叫 `.json` 也放行。
 
 签名或验证前后各取一次身份快照，核对路径、类型、文件身份 `(dev, ino)`、大小和纳秒修改时间；任何变化都返回 2，不产出清单，也不会把验证报告为成功。命令不会修改交付文件。读取失败时向标准错误输出原因，返回状态码 2。生成或验证过程中应保持输入目录不变。
 

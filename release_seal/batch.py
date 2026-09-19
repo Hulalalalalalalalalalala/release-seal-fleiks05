@@ -36,20 +36,16 @@ ARITY = {
 _ITEM_FIELDS = ("id", "command", "args")
 
 
-def load_batch(path: Path) -> list[dict]:
-    """Load and strictly validate a BATCH file.
+def parse_batch(raw: bytes, path: Path) -> list[dict]:
+    """Validate raw BATCH bytes and return the items in input order.
 
-    Returns the items as ``{"id", "command", "args"}`` dicts in input
-    order. Raises :class:`SealError` for any structural problem: the file
-    is not UTF-8 JSON, is not an array, an item is not an object with
-    exactly ``id``/``command``/``args``, an id is empty or duplicated, a
-    command is unknown, args are not strings or their count does not
-    match the command.
+    Returns the items as ``{"id", "command", "args"}`` dicts. Raises
+    :class:`SealError` for any structural problem: the bytes are not
+    UTF-8 JSON, the document is not an array, an item is not an object
+    with exactly ``id``/``command``/``args``, an id is empty or
+    duplicated, a command is unknown, args are not strings or their
+    count does not match the command.
     """
-    try:
-        raw = path.read_bytes()
-    except OSError as error:
-        raise SealError(f"cannot read batch {path}: {error}") from error
     try:
         document = json.loads(raw.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError) as error:
@@ -97,6 +93,20 @@ def load_batch(path: Path) -> list[dict]:
     return items
 
 
+def load_batch(path: Path) -> list[dict]:
+    """Load and strictly validate a BATCH file.
+
+    Returns the items as ``{"id", "command", "args"}`` dicts in input
+    order. Raises :class:`SealError` for any structural problem, exactly
+    like :func:`parse_batch`, or when the file cannot be read.
+    """
+    try:
+        raw = path.read_bytes()
+    except OSError as error:
+        raise SealError(f"cannot read batch {path}: {error}") from error
+    return parse_batch(raw, path)
+
+
 def _run_item(command: str, args: list[Path]) -> dict:
     if command == "verify":
         from .seal import verify_directory
@@ -109,6 +119,43 @@ def _run_item(command: str, args: list[Path]) -> dict:
     from .policy import verify_policy
 
     return verify_policy(args[0], args[1], args[2], args[3])
+
+
+def execute_batch(items: list[dict], base: Path, batch_path: Path) -> list[tuple]:
+    """Run every item in input order, resolving relative args against base.
+
+    Returns one ``(item, code, result, error)`` tuple per item: ``code``
+    is 0 when the result has ``valid: true``, 1 when ``valid: false``
+    and 2 when running the item raised; exactly one of ``result`` and
+    ``error`` is not ``None``. A code-2 item never aborts the run and
+    never writes to standard error.
+    """
+    executed: list[tuple] = []
+    for item in items:
+        resolved = [base / value for value in item["args"]]
+        try:
+            # The BATCH file itself must not live inside a delivery tree;
+            # each command additionally enforces its own outside-tree
+            # rules, O_NOFOLLOW reads and snapshot protection.
+            require_outside(resolved[0], (batch_path,))
+            result = _run_item(item["command"], resolved)
+            code = 0 if result.get("valid") is True else 1
+            executed.append((item, code, result, None))
+        except Exception as error:
+            # Once the BATCH is structurally valid, any per-item failure is
+            # a code-2 item result, never a command-level abort: the run
+            # still reports every item and writes nothing to stderr.
+            executed.append((item, 2, None, error))
+    return executed
+
+
+def batch_exit_code(passed: int, failed: int, errors: int) -> int:
+    """Batch exit code: 2 if any item errored, else 1 on failures, else 0."""
+    if errors:
+        return 2
+    if failed:
+        return 1
+    return 0
 
 
 def verify_batch(batch_path) -> tuple[int, dict]:
@@ -130,29 +177,17 @@ def verify_batch(batch_path) -> tuple[int, dict]:
     base = batch_path.resolve().parent
     results: list[dict] = []
     passed = failed = errors = 0
-    for item in items:
-        resolved = [base / value for value in item["args"]]
-        entry: dict = {"id": item["id"]}
-        try:
-            # The BATCH file itself must not live inside a delivery tree;
-            # each command additionally enforces its own outside-tree
-            # rules, O_NOFOLLOW reads and snapshot protection.
-            require_outside(resolved[0], (batch_path,))
-            result = _run_item(item["command"], resolved)
-            if result.get("valid") is True:
-                entry["code"] = 0
-                passed += 1
-            else:
-                entry["code"] = 1
-                failed += 1
-            entry["result"] = result
-        except Exception as error:
-            # Once the BATCH is structurally valid, any per-item failure is
-            # a code-2 item result, never a command-level abort: the run
-            # still reports every item and writes nothing to stderr.
-            entry["code"] = 2
+    for item, code, result, error in execute_batch(items, base, batch_path):
+        entry: dict = {"id": item["id"], "code": code}
+        if error is not None:
             entry["error"] = str(error) or type(error).__name__
             errors += 1
+        else:
+            entry["result"] = result
+            if code == 0:
+                passed += 1
+            else:
+                failed += 1
         results.append(entry)
     total = len(items)
     report = {
@@ -166,10 +201,4 @@ def verify_batch(batch_path) -> tuple[int, dict]:
         },
         "results": results,
     }
-    if errors:
-        exit_code = 2
-    elif failed:
-        exit_code = 1
-    else:
-        exit_code = 0
-    return exit_code, report
+    return batch_exit_code(passed, failed, errors), report

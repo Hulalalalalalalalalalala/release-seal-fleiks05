@@ -112,6 +112,14 @@ def main() -> int:
         help="verify several delivery trees described by a BATCH JSON file",
     )
     batching.add_argument("batch", help="BATCH JSON file of verify items")
+    auditing = commands.add_parser(
+        "audit-batch",
+        help="verify a BATCH and publish an immutable offline audit report",
+    )
+    auditing.add_argument("batch", help="BATCH JSON file of verify items")
+    auditing.add_argument(
+        "report", help="audit report to create; must not exist yet"
+    )
     trust = commands.add_parser(
         "trust", help="manage the offline public-key trust store"
     )
@@ -170,6 +178,10 @@ def main() -> int:
             from .batch import verify_batch
 
             code, result = verify_batch(args.batch)
+        elif args.command == "audit-batch":
+            from .audit import audit_batch
+
+            code, result = audit_batch(args.batch, args.report)
         elif args.command == "trust":
             from .trust import import_key, revoke_key
 

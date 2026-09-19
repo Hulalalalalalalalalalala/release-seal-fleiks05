@@ -318,10 +318,11 @@ def _forbidden_json_document(document: object) -> str | None:
     """Rejection message for a parsed JSON object, or ``None`` if deliverable.
 
     Only a document that *fully* validates as a version 1/2/3 manifest, a
-    version 1 trust store or a three-field version 1 policy is forbidden.
-    A merely similar object (right field names but invalid values, a
-    foreign ``kind`` or ``version``) passes. Imports live here to avoid an
-    import cycle: ``trust`` and ``policy`` import from this module.
+    version 1 trust store, a three-field version 1 policy or a version 1
+    audit report is forbidden. A merely similar object (right field names
+    but invalid values, a foreign ``kind`` or ``version``) passes.
+    Imports live here to avoid an import cycle: ``trust``, ``policy`` and
+    ``audit`` import from this module.
     """
     if not isinstance(document, dict):
         return None
@@ -344,8 +345,16 @@ def _forbidden_json_document(document: object) -> str | None:
     try:
         validate_policy_document(document)
     except SealError:
+        pass
+    else:
+        return "policies must stay outside the delivery tree"
+    from .audit import validate_audit_document
+
+    try:
+        validate_audit_document(document)
+    except SealError:
         return None
-    return "policies must stay outside the delivery tree"
+    return "audit reports must stay outside the delivery tree"
 
 
 _PEM_MARKER = b"-----BEGIN"
@@ -393,15 +402,16 @@ def _scan_forbidden_kind(path: Path) -> tuple[str, bytes] | None:
 
 
 def reject_forbidden_files(directory: Path, files: list[dict]) -> None:
-    """Reject keys, manifests, trust stores or policies inside the tree.
+    """Reject keys, manifests, trust stores, policies or audit reports in the tree.
 
     Detection is by content, not by name or extension. A file is refused
     when its bytes load as a PEM key of any algorithm (or clearly are an
     encrypted PEM private key missing its password), or when they parse as
     UTF-8 JSON fully validating as a version 1/2/3 manifest, a version 1
-    trust store or a three-field version 1 policy. Certificates, ordinary
-    PEM, DER/OpenSSH/PKCS#12 blobs and malformed-but-similar JSON are all
-    deliverable, whatever the file is called.
+    trust store, a three-field version 1 policy or a version 1 audit
+    report. Certificates, ordinary PEM, DER/OpenSSH/PKCS#12 blobs and
+    malformed-but-similar JSON are all deliverable, whatever the file is
+    called.
     """
     for record in files:
         rel = record["path"]
@@ -428,8 +438,8 @@ def guarded_inventory(directory: Path) -> list[dict]:
     ``(dev, ino)`` identity, sizes and nanosecond mtimes. Every content
     read (hashing and forbidden-file classification) happens between the
     two snapshots, so a swapped or modified file is always caught. The
-    tree is also refused if it contains keys, manifests, trust stores
-    or policies.
+    tree is also refused if it contains keys, manifests, trust stores,
+    policies or audit reports.
     """
     before = stat_snapshot(directory)
     files = inventory(directory)
@@ -470,7 +480,8 @@ def _staged_temp(parent: Path, hint: str, data: bytes) -> Path:
     return tmp
 
 
-def publish_new(target: Path, data: bytes, *, hint: str = "manifest") -> None:
+def publish_new(target: Path, data: bytes, *, hint: str = "manifest",
+                what: str = "manifest") -> None:
     """Publish data once, never overwriting an existing target.
 
     The bytes land in a synced temp file in target's directory and are
@@ -478,7 +489,8 @@ def publish_new(target: Path, data: bytes, *, hint: str = "manifest") -> None:
     target is left byte-for-byte untouched; on failure no temp file or
     half-written target remains. If the directory sync after publishing
     fails, the complete new target stays in place, the temp file is
-    removed and the error reports that durability is uncertain.
+    removed and the error reports that durability is uncertain. ``what``
+    only names the artifact in error messages.
     """
     parent = target.parent
     tmp = _staged_temp(parent, hint, data)
@@ -487,15 +499,15 @@ def publish_new(target: Path, data: bytes, *, hint: str = "manifest") -> None:
         try:
             os.link(tmp, target)
         except FileExistsError as error:
-            raise SealError(f"manifest already exists: {target}") from error
+            raise SealError(f"{what} already exists: {target}") from error
         except OSError as error:
-            raise SealError(f"cannot publish manifest {target}: {error}") from error
+            raise SealError(f"cannot publish {what} {target}: {error}") from error
         published = True
         try:
             _sync_directory(parent)
         except OSError as error:
             raise SealError(
-                f"manifest published but directory sync failed; durability "
+                f"{what} published but directory sync failed; durability "
                 f"is uncertain: {target}: {error}"
             ) from error
     finally:
