@@ -1,6 +1,6 @@
 # Release Seal
 
-为本地文件交付目录生成可读的文件清单，并用 Ed25519 签名实现可信的离线交付。需要 Python 3.10 或更高版本；`inventory` 仅依赖标准库，`sign`、`sign-multi`、`verify`、`trust`、`verify-trusted`、`verify-policy` 和 `demo` 需要 `cryptography` 包。
+为本地文件交付目录生成可读的文件清单，并用 Ed25519 签名实现可信的离线交付。需要 Python 3.10 或更高版本；`inventory` 仅依赖标准库，`sign`、`sign-multi`、`verify`、`trust`、`verify-trusted`、`verify-policy`、`verify-batch` 和 `demo` 需要 `cryptography` 包。
 
 ```sh
 python3 -m release_seal --help
@@ -12,6 +12,7 @@ python3 -m release_seal trust import public.pem trust.json
 python3 -m release_seal trust revoke trust.json KEY_ID "key compromised"
 python3 -m release_seal verify-trusted examples/package manifest.json trust.json
 python3 -m release_seal verify-policy examples/package manifest.json trust.json policy.json
+python3 -m release_seal verify-batch batch.json
 python3 -m release_seal demo
 python3 -m unittest discover -s tests -v
 ```
@@ -77,9 +78,18 @@ python3 -m unittest discover -s tests -v
 - 达到阈值后才盘点目录：完全一致返回 0 并输出 `valid:true`；有差异返回 1，输出 `reason: "file_mismatch"` 和按路径排序的三类列表。
 - 策略、库或清单格式错误、I/O 错误、扫描期间目录变化：返回 2。任何失败都输出 `valid:false`，绝不声称成功。
 
+## verify-batch：批量验证
+
+`verify-batch BATCH` 从 UTF-8 JSON 数组批量执行验证。数组每项恰好包含三个字段：`id`（唯一、非空字符串）、`command`（`verify`、`verify-trusted` 或 `verify-policy` 之一）和 `args`（与该命令参数数目一致的字符串数组）。项内的相对路径基于 BATCH 文件所在目录解析；BATCH 本身必须位于它涉及的每个交付树之外，其余限制与各命令相同。
+
+结构错误、重复 `id` 或参数数目不符：原因写标准错误，返回 2，不输出汇总。否则按输入顺序执行各项，标准输出一份 JSON 报告：`version`（`1`）、`valid`、`summary` 和 `results`。`summary` 含 `total`（项数）以及按各项退出码统计的 `passed`（0）、`failed`（1）、`errors`（2）；`results` 按执行顺序每项含 `id` 与 `code`，退出码 0/1 附该命令的原始 `result`，退出码 2 附非空 `error`（此时不向标准错误输出）。`valid` 仅当所有项退出码均为 0 时为真；任一项为 2 返回 2，否则任一项为 1 返回 1，否则返回 0。
+
 ## 扫描一致性与目录限制
 
-所有命令沿用相同的目录限制：输入必须是目录，目录树不支持符号链接和特殊文件（读取文件时使用 `O_NOFOLLOW`，防止检查后被换成符号链接）。私钥、公钥、清单、信任库和策略不得位于交付目录内——既包括命令行参数，也包括盘点时在交付树中发现的同类文件。树内识别**按内容而非文件名**：普通的 `.pem`、`.json` 文件可以正常交付；真实含 `-----BEGIN ... KEY-----` 标记的密钥文件，以及结构上与清单（版本 1/2/3）、信任库或策略匹配的 JSON 文档，无论叫什么文件名都会被拒绝。
+所有命令沿用相同的目录限制：输入必须是目录，目录树不支持符号链接和特殊文件（读取文件时使用 `O_NOFOLLOW`，防止检查后被换成符号链接）。私钥、公钥、清单、信任库和策略不得位于交付目录内——既包括命令行参数，也包括盘点时在交付树中发现的同类文件。树内识别**按内容而非文件名或扩展名**：普通的 `.pem`、`.json` 文件可以正常交付；任何文件只要内容被判定为密钥或受管 JSON 就会被拒绝。
+
+- PEM 内容依次尝试 `load_pem_public_key` 与 `load_pem_private_key(password=None)`：任意算法的公钥或私钥加载成功即拒绝；加载器明确报告加密私钥缺少密码（`TypeError`）同样拒绝。DER、OpenSSH 与 PKCS#12 不作检查，证书和普通 PEM 文本可以交付。
+- UTF-8 JSON 只有**完整通过**版本 1/2/3 清单、版本 1 信任库或三字段版本 1 策略的校验才被拒绝；字段不符、签名非法等畸形相似对象均可交付。
 
 签名或验证前后各取一次身份快照，核对路径、类型、文件身份 `(dev, ino)`、大小和纳秒修改时间；任何变化都返回 2，不产出清单，也不会把验证报告为成功。命令不会修改交付文件。读取失败时向标准错误输出原因，返回状态码 2。生成或验证过程中应保持输入目录不变。
 

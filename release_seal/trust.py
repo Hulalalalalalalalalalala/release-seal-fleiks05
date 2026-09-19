@@ -62,7 +62,7 @@ def _new_store() -> dict:
     }
 
 
-def _validate_store(document: object, path: Path) -> dict:
+def validate_store_document(document: object, path: Path) -> dict:
     if not isinstance(document, dict):
         raise SealError(f"trust store must be a JSON object: {path}")
     if document.get("kind") != TRUST_STORE_KIND:
@@ -118,7 +118,7 @@ def load_store(path: Path) -> dict:
         document = json.loads(raw)
     except (json.JSONDecodeError, ValueError) as error:
         raise SealError(f"trust store is not UTF-8 JSON: {path}: {error}") from error
-    return _validate_store(document, path)
+    return validate_store_document(document, path)
 
 
 def _write_store(path: Path, document: dict) -> None:

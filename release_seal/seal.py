@@ -196,6 +196,11 @@ def load_manifest(path: Path, versions: tuple = SUPPORTED_VERSIONS):
         document = json.loads(raw.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError) as error:
         raise SealError(f"manifest is not UTF-8 JSON: {path}: {error}") from error
+    return validate_manifest_document(document, path, versions)
+
+
+def validate_manifest_document(document: object, path: Path, versions: tuple):
+    """Validate a parsed manifest document; see load_manifest."""
     if not isinstance(document, dict):
         raise SealError(f"manifest must be a JSON object: {path}")
     version = document.get("version")
@@ -266,22 +271,7 @@ def diff_inventory(expected: list[dict], actual: list[dict]) -> tuple[list, list
     return modified, missing, unexpected
 
 
-def _looks_like_manifest(document: dict) -> bool:
-    keys = set(document)
-    if keys in (set(V1_FIELDS), set(V2_FIELDS), set(V3_FIELDS)):
-        return document.get("algorithm") == ALGORITHM
-    return False
-
-
-def _looks_like_trust_store(document: dict) -> bool:
-    return document.get("kind") == TRUST_STORE_KIND and "keys" in document
-
-
-def _looks_like_policy(document: dict) -> bool:
-    return set(document) == set(POLICY_FIELDS)
-
-
-def _read_nofollow(path: Path, max_bytes: int | None = None) -> bytes:
+def _read_nofollow(path: Path) -> bytes:
     """Read a regular file without ever following a swapped-in symlink."""
     flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
     try:
@@ -289,46 +279,83 @@ def _read_nofollow(path: Path, max_bytes: int | None = None) -> bytes:
     except OSError as error:
         raise SealError(f"cannot read {path}: {error}") from error
     with os.fdopen(fd, "rb") as source:
-        if max_bytes is None:
-            return source.read()
-        return source.read(max_bytes)
+        return source.read()
+
+
+def _is_pem_key(data: bytes) -> bool:
+    """True when data holds a PEM key that cryptography can load.
+
+    Public keys are tried first, then private keys without a password;
+    a successful load of either, of any algorithm, counts as a key. An
+    encrypted private key — the loader reports a missing password with
+    ``TypeError`` — counts as well. DER, OpenSSH and PKCS#12 blobs are
+    not inspected; certificates and ordinary PEM pass.
+    """
+    if b"-----BEGIN " not in data:
+        return False
+    try:
+        load_pem_public_key(data)
+    except Exception:
+        pass
+    else:
+        return True
+    try:
+        load_pem_private_key(data, password=None)
+    except TypeError:
+        # "Password was not given but private key is encrypted."
+        return True
+    except Exception:
+        return False
+    return True
+
+
+def _validates(check, document: dict, path: Path) -> bool:
+    try:
+        check(document, path)
+    except SealError:
+        return False
+    return True
 
 
 def reject_forbidden_files(directory: Path, files: list[dict]) -> None:
     """Reject keys, manifests, trust stores or policies inside the tree.
 
-    Detection is by content, not by name: an ordinary ``.pem`` or
-    ``.json`` file is deliverable, while a real PEM key block or a JSON
-    document structurally matching a manifest, trust store or policy is
-    refused whatever its file name.
+    Detection is by content, never by file name or extension. A file is
+    refused when its bytes load as a PEM public or private key (any
+    algorithm, encrypted private keys included), or when it is UTF-8
+    JSON that fully passes the version 1/2/3 manifest, version 1 trust
+    store or three-field version 1 policy validation. Malformed
+    lookalikes, certificates and ordinary PEM or JSON files stay
+    deliverable.
     """
+    # Imported lazily: trust and policy themselves import this module.
+    from .policy import validate_policy_document
+    from .trust import validate_store_document
+
+    def check_manifest(document, path):
+        validate_manifest_document(document, path, versions=(1, 2, 3))
+
+    checks = (
+        (check_manifest, "manifests"),
+        (validate_store_document, "trust stores"),
+        (validate_policy_document, "policies"),
+    )
     for record in files:
-        rel = record["path"]
-        path = directory / rel
-        name = rel.rsplit("/", 1)[-1].lower()
-        prefix = _read_nofollow(path, 256).lstrip()
-        if prefix.startswith(b"-----BEGIN ") and b"KEY-----" in prefix[:80]:
+        path = directory / record["path"]
+        data = _read_nofollow(path)
+        if _is_pem_key(data):
             raise SealError(f"keys must stay outside the delivery tree: {path}")
-        if not name.endswith(".json"):
-            continue
         try:
-            document = json.loads(_read_nofollow(path).decode("utf-8"))
-        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            document = json.loads(data.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
             continue
         if not isinstance(document, dict):
             continue
-        if _looks_like_manifest(document):
-            raise SealError(
-                f"manifests must stay outside the delivery tree: {path}"
-            )
-        if _looks_like_trust_store(document):
-            raise SealError(
-                f"trust stores must stay outside the delivery tree: {path}"
-            )
-        if _looks_like_policy(document):
-            raise SealError(
-                f"policies must stay outside the delivery tree: {path}"
-            )
+        for check, label in checks:
+            if _validates(check, document, path):
+                raise SealError(
+                    f"{label} must stay outside the delivery tree: {path}"
+                )
 
 
 def guarded_inventory(directory: Path) -> list[dict]:

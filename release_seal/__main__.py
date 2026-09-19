@@ -107,6 +107,11 @@ def main() -> int:
     policy_check.add_argument("manifest", help="version 3 manifest to verify")
     policy_check.add_argument("store", help="versioned trust store JSON file")
     policy_check.add_argument("policy", help="threshold policy JSON file")
+    batching = commands.add_parser(
+        "verify-batch",
+        help="run several verification commands from one JSON batch file",
+    )
+    batching.add_argument("batch", help="UTF-8 JSON batch file")
     trust = commands.add_parser(
         "trust", help="manage the offline public-key trust store"
     )
@@ -161,6 +166,10 @@ def main() -> int:
                 args.directory, args.manifest, args.store, args.policy
             )
             code = 0 if result["valid"] else 1
+        elif args.command == "verify-batch":
+            from .batch import verify_batch
+
+            result, code = verify_batch(args.batch)
         elif args.command == "trust":
             from .trust import import_key, revoke_key
 

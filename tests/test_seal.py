@@ -224,6 +224,111 @@ class SignTests(SealTestCase):
         with self.assertRaises(SealError):
             sign_directory(self.delivery, self.private, self.manifest)
 
+    def test_forbidden_content_is_rejected_whatever_the_extension(self):
+        sign_directory(self.delivery, self.private, self.manifest)
+        manifest_bytes = self.manifest.read_bytes()
+        self.manifest.unlink()
+        (self.delivery / "payload.bin").write_bytes(manifest_bytes)
+        with self.assertRaises(SealError):
+            sign_directory(self.delivery, self.private, self.manifest)
+        (self.delivery / "payload.bin").unlink()
+        (self.delivery / "store.txt").write_text(
+            json.dumps({
+                "kind": "release-seal-trust-store",
+                "version": 1,
+                "algorithm": "Ed25519",
+                "keys": {},
+            }),
+            encoding="utf-8",
+        )
+        with self.assertRaises(SealError):
+            sign_directory(self.delivery, self.private, self.manifest)
+        (self.delivery / "store.txt").unlink()
+        (self.delivery / "policy").write_text(
+            json.dumps({
+                "version": 1,
+                "threshold": 1,
+                "allowed_key_ids": ["0" * 64],
+            }),
+            encoding="utf-8",
+        )
+        with self.assertRaises(SealError):
+            sign_directory(self.delivery, self.private, self.manifest)
+
+    def test_malformed_lookalikes_are_deliverable(self):
+        sign_directory(self.delivery, self.private, self.manifest)
+        document = json.loads(self.manifest.read_text(encoding="utf-8"))
+        self.manifest.unlink()
+        lookalike = dict(document, signature="not-base64!!!")
+        (self.delivery / "lookalike.json").write_text(
+            json.dumps(lookalike), encoding="utf-8"
+        )
+        extra_field = dict(document, extra=1)
+        (self.delivery / "extra.json").write_text(
+            json.dumps(extra_field), encoding="utf-8"
+        )
+        (self.delivery / "store.json").write_text(
+            json.dumps({
+                "kind": "release-seal-trust-store",
+                "version": 1,
+                "algorithm": "Ed25519",
+                "keys": {"not-a-key-id": {}},
+            }),
+            encoding="utf-8",
+        )
+        (self.delivery / "policy.json").write_text(
+            json.dumps({
+                "version": 1,
+                "threshold": 5,
+                "allowed_key_ids": ["0" * 64],
+            }),
+            encoding="utf-8",
+        )
+        result = sign_directory(self.delivery, self.private, self.manifest)
+        paths = [record["path"] for record in result["files"]]
+        self.assertIn("lookalike.json", paths)
+        self.assertIn("extra.json", paths)
+        self.assertIn("store.json", paths)
+        self.assertIn("policy.json", paths)
+
+    def test_encrypted_and_foreign_algorithm_pem_keys_are_rejected(self):
+        from cryptography.hazmat.primitives.serialization import (
+            BestAvailableEncryption,
+        )
+
+        key = load_pem_private_key(self.private.read_bytes(), password=None)
+        (self.delivery / "enc.pem").write_bytes(
+            key.private_bytes(
+                Encoding.PEM,
+                PrivateFormat.PKCS8,
+                BestAvailableEncryption(b"secret"),
+            )
+        )
+        with self.assertRaises(SealError):
+            sign_directory(self.delivery, self.private, self.manifest)
+        (self.delivery / "enc.pem").unlink()
+        rsa_public = generate_private_key(
+            public_exponent=65537, key_size=2048
+        ).public_key()
+        (self.delivery / "rsa.pub").write_bytes(
+            rsa_public.public_bytes(Encoding.PEM, PublicFormat.SubjectPublicKeyInfo)
+        )
+        with self.assertRaises(SealError):
+            sign_directory(self.delivery, self.private, self.manifest)
+
+    def test_der_and_openssh_keys_are_not_inspected(self):
+        key = load_pem_private_key(self.private.read_bytes(), password=None)
+        (self.delivery / "key.der").write_bytes(
+            key.private_bytes(Encoding.DER, PrivateFormat.PKCS8, NoEncryption())
+        )
+        (self.delivery / "id_ssh").write_bytes(
+            key.private_bytes(Encoding.PEM, PrivateFormat.OpenSSH, NoEncryption())
+        )
+        result = sign_directory(self.delivery, self.private, self.manifest)
+        paths = [record["path"] for record in result["files"]]
+        self.assertIn("key.der", paths)
+        self.assertIn("id_ssh", paths)
+
     def test_directory_sync_failure_keeps_target_and_reports_durability(self):
         from release_seal import seal as seal_module
 

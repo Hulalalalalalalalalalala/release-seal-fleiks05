@@ -49,6 +49,11 @@ def load_policy(path: Path) -> dict:
         document = json.loads(raw.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError) as error:
         raise SealError(f"policy is not UTF-8 JSON: {path}: {error}") from error
+    return validate_policy_document(document, path)
+
+
+def validate_policy_document(document: object, path: Path) -> dict:
+    """Validate a parsed policy document; see load_policy."""
     if not isinstance(document, dict):
         raise SealError(f"policy must be a JSON object: {path}")
     if set(document) != set(POLICY_FIELDS):
