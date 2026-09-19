@@ -485,5 +485,260 @@ class DemoTests(unittest.TestCase):
         self.assertIn("private key has been removed", result.stdout)
 
 
+def _certificate_pem():
+    import datetime
+
+    from cryptography import x509
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric.rsa import generate_private_key
+    from cryptography.x509.oid import NameOID
+
+    rsa = generate_private_key(public_exponent=65537, key_size=2048)
+    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "test")])
+    cert = (
+        x509.CertificateBuilder()
+        .subject_name(name)
+        .issuer_name(name)
+        .public_key(rsa.public_key())
+        .serial_number(1)
+        .not_valid_before(datetime.datetime(2020, 1, 1))
+        .not_valid_after(datetime.datetime(2030, 1, 1))
+        .sign(rsa, hashes.SHA256())
+    )
+    return cert.public_bytes(serialization.Encoding.PEM)
+
+
+class ForbiddenContentTests(SealTestCase):
+    """Content (not extension/name) classification inside a delivery tree."""
+
+    def place(self, name, data):
+        target = self.delivery / name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if isinstance(data, str):
+            target.write_text(data, encoding="utf-8")
+        else:
+            target.write_bytes(data)
+        return target
+
+    def assertRefused(self, name, data):
+        target = self.place(name, data)
+        with self.assertRaises(SealError):
+            sign_directory(self.delivery, self.private, self.manifest)
+        target.unlink()
+
+    def assertDeliverable(self, name, data):
+        self.place(name, data)
+        document = sign_directory(self.delivery, self.private, self.manifest)
+        paths = [record["path"] for record in document["files"]]
+        self.assertIn(name, paths)
+        self.manifest.unlink()
+
+    def test_pem_keys_of_any_algorithm_are_rejected_whatever_the_name(self):
+        from cryptography.hazmat.primitives.asymmetric.rsa import generate_private_key
+        from cryptography.hazmat.primitives.asymmetric.ec import (
+            SECP256R1,
+            generate_private_key as generate_ec,
+        )
+        from cryptography.hazmat.primitives.serialization import (
+            PrivateFormat,
+            PublicFormat,
+        )
+
+        rsa = generate_private_key(public_exponent=65537, key_size=2048)
+        ec = generate_ec(SECP256R1())
+        cases = {
+            "rsa-private.bin": rsa.private_bytes(
+                Encoding.PEM, PrivateFormat.PKCS8, NoEncryption()
+            ),
+            "nested/rsa-public.dat": rsa.public_key().public_bytes(
+                Encoding.PEM, PublicFormat.SubjectPublicKeyInfo
+            ),
+            "rsa-pkcs1-public.txt": rsa.public_key().public_bytes(
+                Encoding.PEM, PublicFormat.PKCS1
+            ),
+            "ec-private": ec.private_bytes(
+                Encoding.PEM, PrivateFormat.TraditionalOpenSSL, NoEncryption()
+            ),
+            "payload.txt": self.private.read_bytes(),
+            "bundle.bak": self.public.read_bytes(),
+        }
+        for name, data in cases.items():
+            with self.subTest(name=name):
+                target = self.place(name, data)
+                with self.assertRaises(SealError):
+                    sign_directory(self.delivery, self.private, self.manifest)
+                target.unlink()
+
+    def test_encrypted_pem_private_keys_are_rejected(self):
+        from cryptography.hazmat.primitives.asymmetric.rsa import generate_private_key
+        from cryptography.hazmat.primitives.serialization import (
+            BestAvailableEncryption,
+            PrivateFormat,
+        )
+
+        rsa = generate_private_key(public_exponent=65537, key_size=2048)
+        for fmt in (PrivateFormat.PKCS8, PrivateFormat.TraditionalOpenSSL):
+            encrypted = rsa.private_bytes(
+                Encoding.PEM, fmt, BestAvailableEncryption(b"password"),
+            )
+            with self.subTest(fmt=fmt):
+                target = self.place("locked.key", encrypted)
+                with self.assertRaises(SealError):
+                    sign_directory(self.delivery, self.private, self.manifest)
+                target.unlink()
+
+    def test_certificates_and_non_key_pem_are_deliverable(self):
+        self.assertDeliverable("cert.pem", _certificate_pem())
+        self.assertDeliverable("cert-as-text.txt", _certificate_pem())
+        self.assertDeliverable("notes.pem", b"not a key at all\n")
+        self.assertDeliverable(
+            "fake.pem",
+            b"-----BEGIN MADE UP THING-----\nAAAA\n-----END MADE UP THING-----\n",
+        )
+        self.assertDeliverable(
+            "garbage-armored.pem",
+            b"-----BEGIN PUBLIC KEY-----\n@@@@bad@@@@\n"
+            b"-----END PUBLIC KEY-----\n",
+        )
+
+    def test_der_openssh_and_pkcs12_are_not_checked(self):
+        import datetime
+
+        from cryptography import x509
+        from cryptography.hazmat.primitives import hashes, serialization
+        from cryptography.hazmat.primitives.asymmetric.rsa import generate_private_key
+        from cryptography.hazmat.primitives.serialization import pkcs12
+        from cryptography.x509.oid import NameOID
+
+        ed_public_der = load_pem_public_key(self.public.read_bytes()).public_bytes(
+            Encoding.DER, PublicFormat.SubjectPublicKeyInfo
+        )
+        ed_private_der = load_pem_private_key(
+            self.private.read_bytes(), password=None
+        ).private_bytes(Encoding.DER, PrivateFormat.PKCS8, NoEncryption())
+        openssh_private = load_pem_private_key(
+            self.private.read_bytes(), password=None
+        ).private_bytes(Encoding.PEM, PrivateFormat.OpenSSH, NoEncryption())
+        rsa = generate_private_key(public_exponent=65537, key_size=2048)
+        name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "t")])
+        cert = (
+            x509.CertificateBuilder()
+            .subject_name(name)
+            .issuer_name(name)
+            .public_key(rsa.public_key())
+            .serial_number(1)
+            .not_valid_before(datetime.datetime(2020, 1, 1))
+            .not_valid_after(datetime.datetime(2030, 1, 1))
+            .sign(rsa, hashes.SHA256())
+        )
+        p12 = pkcs12.serialize_key_and_certificates(
+            b"n", rsa, cert, None,
+            serialization.BestAvailableEncryption(b"pw"),
+        )
+        for name_, data in (
+            ("pub.der", ed_public_der),
+            ("priv.der", ed_private_der),
+            ("id_openssh", openssh_private),
+            ("bundle.p12", p12),
+        ):
+            with self.subTest(name=name_):
+                self.assertDeliverable(name_, data)
+
+    def test_marker_and_json_are_found_past_large_preamble(self):
+        # The streaming pre-scan must catch a PEM marker or JSON object
+        # even when it starts far into the file / straddles a chunk edge.
+        chunk = 1024 * 1024
+        for offset in range(-12, 1):
+            target = self.delivery / f"late-{offset}"
+            target.write_bytes(b"x" * (chunk + offset) + self.private.read_bytes())
+            with self.assertRaises(SealError):
+                sign_directory(self.delivery, self.private, self.manifest)
+            target.unlink()
+        policy = json.dumps({
+            "version": 1, "threshold": 1, "allowed_key_ids": ["a" * 64],
+        }).encode("utf-8")
+        target = self.directory_late_json(policy)
+        with self.assertRaises(SealError):
+            sign_directory(self.delivery, self.private, self.manifest)
+        target.unlink()
+        # A large ordinary binary (no marker, not an object) delivers.
+        big = self.delivery / "big.bin"
+        big.write_bytes(b"\x00" * (3 * chunk))
+        document = sign_directory(self.delivery, self.private, self.manifest)
+        self.assertIn("big.bin", [r["path"] for r in document["files"]])
+        self.manifest.unlink()
+        big.unlink()
+
+    def directory_late_json(self, payload: bytes) -> Path:
+        chunk = 1024 * 1024
+        target = self.delivery / "late.json"
+        target.write_bytes(b" " * (2 * chunk + 3) + payload)
+        return target
+
+    def test_real_manifests_stores_and_policies_rejected_any_extension(self):
+        sig = base64.b64encode(b"\x00" * 64).decode("ascii")
+        cases = {
+            "m-v1.log": json.dumps({
+                "version": 1, "algorithm": "Ed25519", "hash": "SHA-256",
+                "files": [], "signature": sig,
+            }),
+            "m-v2.txt": json.dumps({
+                "version": 2, "algorithm": "Ed25519", "hash": "SHA-256",
+                "key_id": "a" * 64, "files": [], "signature": sig,
+            }),
+            "m-v3.cfg": json.dumps({
+                "version": 3, "algorithm": "Ed25519", "hash": "SHA-256",
+                "files": [], "signatures": {"a" * 64: sig},
+            }),
+            "store": json.dumps({
+                "kind": "release-seal-trust-store", "version": 1,
+                "algorithm": "Ed25519", "keys": {},
+            }),
+            "policy.blob": json.dumps({
+                "version": 1, "threshold": 1, "allowed_key_ids": ["a" * 64],
+            }),
+        }
+        for name, data in cases.items():
+            with self.subTest(name=name):
+                self.assertRefused(name, data)
+
+    def test_extension_does_not_matter_for_similar_json(self):
+        # Shape-similar but invalid documents are deliverable under ANY
+        # extension, including .json.
+        sig = base64.b64encode(b"\x00" * 64).decode("ascii")
+        cases = {
+            "a.json": json.dumps({
+                "version": 1, "algorithm": "Ed25519", "hash": "SHA-256",
+                "files": [], "signature": "short",
+            }),
+            "b.json": json.dumps({
+                "version": 9, "algorithm": "Ed25519", "hash": "SHA-256",
+                "files": [], "signature": sig,
+            }),
+            "c.json": json.dumps({
+                "version": 1, "algorithm": "RSA", "hash": "SHA-256",
+                "files": [], "signature": sig,
+            }),
+            "d.json": json.dumps({
+                "kind": "something-else", "version": 1,
+                "algorithm": "Ed25519", "keys": {},
+            }),
+            "e.json": json.dumps({
+                "kind": "release-seal-trust-store", "version": 2,
+                "algorithm": "Ed25519", "keys": {},
+            }),
+            "f.json": json.dumps({"version": 1, "threshold": 0,
+                                  "allowed_key_ids": ["a" * 64]}),
+            "g.json": json.dumps({"version": 1, "threshold": 1,
+                                  "allowed_key_ids": ["a" * 64], "x": 1}),
+            "h.policy": json.dumps({"version": 2, "threshold": 1,
+                                    "allowed_key_ids": ["a" * 64]}),
+            "i.txt": json.dumps([1, 2, 3]),
+        }
+        for name, data in cases.items():
+            with self.subTest(name=name):
+                self.assertDeliverable(name, data)
+
+
 if __name__ == "__main__":
     unittest.main()

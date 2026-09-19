@@ -39,6 +39,57 @@ REASON_THRESHOLD_NOT_MET = "threshold_not_met"
 REASON_FILE_MISMATCH = "file_mismatch"
 
 
+def validate_policy_document(document: object) -> dict:
+    """Strictly validate a parsed threshold policy JSON document.
+
+    Only a version 1 policy with exactly ``version``, ``threshold`` and
+    ``allowed_key_ids`` (positive threshold, a non-empty list of distinct
+    valid key ids no shorter than the threshold) passes. Raises
+    :class:`SealError` on any mismatch.
+    """
+    if not isinstance(document, dict):
+        raise SealError("policy must be a JSON object")
+    if set(document) != set(POLICY_FIELDS):
+        raise SealError(
+            f"policy must contain exactly "
+            f"{', '.join(sorted(POLICY_FIELDS))}"
+        )
+    version = document["version"]
+    if (
+        not isinstance(version, int)
+        or isinstance(version, bool)
+        or version != POLICY_VERSION
+    ):
+        raise SealError(f"policy field 'version' must be {POLICY_VERSION}")
+    threshold = document["threshold"]
+    if (
+        not isinstance(threshold, int)
+        or isinstance(threshold, bool)
+        or threshold < 1
+    ):
+        raise SealError(
+            "policy field 'threshold' must be a positive integer"
+        )
+    allowed = document["allowed_key_ids"]
+    if not isinstance(allowed, list) or not allowed:
+        raise SealError(
+            "policy field 'allowed_key_ids' must be a non-empty list"
+        )
+    if any(not is_key_id(key_id) for key_id in allowed):
+        raise SealError("policy 'allowed_key_ids' holds an invalid key id")
+    if len(set(allowed)) != len(allowed):
+        raise SealError("policy 'allowed_key_ids' holds duplicates")
+    if threshold > len(allowed):
+        raise SealError(
+            "policy threshold exceeds the number of allowed key ids"
+        )
+    return {
+        "version": version,
+        "threshold": threshold,
+        "allowed_key_ids": allowed,
+    }
+
+
 def load_policy(path: Path) -> dict:
     """Load and strictly validate a threshold policy document."""
     try:
@@ -49,47 +100,10 @@ def load_policy(path: Path) -> dict:
         document = json.loads(raw.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError) as error:
         raise SealError(f"policy is not UTF-8 JSON: {path}: {error}") from error
-    if not isinstance(document, dict):
-        raise SealError(f"policy must be a JSON object: {path}")
-    if set(document) != set(POLICY_FIELDS):
-        raise SealError(
-            f"policy must contain exactly "
-            f"{', '.join(sorted(POLICY_FIELDS))}: {path}"
-        )
-    version = document["version"]
-    if (
-        not isinstance(version, int)
-        or isinstance(version, bool)
-        or version != POLICY_VERSION
-    ):
-        raise SealError(f"policy field 'version' must be {POLICY_VERSION}: {path}")
-    threshold = document["threshold"]
-    if (
-        not isinstance(threshold, int)
-        or isinstance(threshold, bool)
-        or threshold < 1
-    ):
-        raise SealError(
-            f"policy field 'threshold' must be a positive integer: {path}"
-        )
-    allowed = document["allowed_key_ids"]
-    if not isinstance(allowed, list) or not allowed:
-        raise SealError(
-            f"policy field 'allowed_key_ids' must be a non-empty list: {path}"
-        )
-    if any(not is_key_id(key_id) for key_id in allowed):
-        raise SealError(f"policy 'allowed_key_ids' holds an invalid key id: {path}")
-    if len(set(allowed)) != len(allowed):
-        raise SealError(f"policy 'allowed_key_ids' holds duplicates: {path}")
-    if threshold > len(allowed):
-        raise SealError(
-            f"policy threshold exceeds the number of allowed key ids: {path}"
-        )
-    return {
-        "version": version,
-        "threshold": threshold,
-        "allowed_key_ids": allowed,
-    }
+    try:
+        return validate_policy_document(document)
+    except SealError as error:
+        raise SealError(f"{error}: {path}") from error
 
 
 def verify_policy(directory, manifest_path, store_path, policy_path) -> dict:

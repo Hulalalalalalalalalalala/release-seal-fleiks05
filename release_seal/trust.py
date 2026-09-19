@@ -62,51 +62,64 @@ def _new_store() -> dict:
     }
 
 
-def _validate_store(document: object, path: Path) -> dict:
+def validate_store_document(document: object) -> dict:
+    """Strictly validate a parsed trust store JSON document.
+
+    Returns the document when it is a well-formed version 1 release seal
+    trust store whose embedded public keys parse as Ed25519 and match
+    their key ids. Raises :class:`SealError` otherwise.
+    """
     if not isinstance(document, dict):
-        raise SealError(f"trust store must be a JSON object: {path}")
+        raise SealError("trust store must be a JSON object")
     if document.get("kind") != TRUST_STORE_KIND:
-        raise SealError(f"not a release seal trust store: {path}")
+        raise SealError("not a release seal trust store")
     version = document.get("version")
     if not isinstance(version, int) or isinstance(version, bool):
-        raise SealError(f"trust store field 'version' must be an integer: {path}")
+        raise SealError("trust store field 'version' must be an integer")
     if version < 1 or version > STORE_VERSION:
         raise SealError(
             f"trust store version {version} is not supported "
-            f"(supported: {STORE_VERSION}): {path}"
+            f"(supported: {STORE_VERSION})"
         )
     if document.get("algorithm") != ALGORITHM:
-        raise SealError(f"trust store field 'algorithm' must be {ALGORITHM!r}: {path}")
+        raise SealError(f"trust store field 'algorithm' must be {ALGORITHM!r}")
     keys = document.get("keys")
     if not isinstance(keys, dict):
-        raise SealError(f"trust store field 'keys' must be an object: {path}")
+        raise SealError("trust store field 'keys' must be an object")
     for stored_id, record in keys.items():
         if not is_key_id(stored_id):
-            raise SealError(f"trust store holds an invalid key id: {path}")
+            raise SealError("trust store holds an invalid key id")
         if not isinstance(record, dict) or set(record) != {
             "public_key_pem",
             "status",
             "revoked_reason",
         }:
-            raise SealError(f"trust store entry {stored_id} is malformed: {path}")
+            raise SealError(f"trust store entry {stored_id} is malformed")
         pem = record["public_key_pem"]
         status = record["status"]
         reason = record["revoked_reason"]
         if not isinstance(pem, str) or status not in (ACTIVE, REVOKED):
-            raise SealError(f"trust store entry {stored_id} is malformed: {path}")
+            raise SealError(f"trust store entry {stored_id} is malformed")
         if reason is not None and not isinstance(reason, str):
-            raise SealError(f"trust store entry {stored_id} is malformed: {path}")
+            raise SealError(f"trust store entry {stored_id} is malformed")
         try:
-            key = decode_public_key(pem.encode("ascii"), where=str(path))
+            key = decode_public_key(pem.encode("ascii"), where="trust store")
         except SealError as error:
             raise SealError(
-                f"trust store entry {stored_id} holds an invalid public key: {path}"
+                f"trust store entry {stored_id} holds an invalid public key"
             ) from error
         if key_id_of(key) != stored_id:
             raise SealError(
-                f"trust store entry {stored_id} does not match its key id: {path}"
+                f"trust store entry {stored_id} does not match its key id"
             )
     return document
+
+
+def _validate_store(document: object, path: Path) -> dict:
+    try:
+        return validate_store_document(document)
+    except SealError as error:
+        raise SealError(f"{error}: {path}") from error
 
 
 def load_store(path: Path) -> dict:

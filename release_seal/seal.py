@@ -43,6 +43,7 @@ VERSION = 1
 VERSION_CURRENT = 2
 VERSION_MULTI = 3
 SUPPORTED_VERSIONS = (1, 2)
+ALL_MANIFEST_VERSIONS = (1, 2, 3)
 MULTI_VERSIONS = (VERSION_MULTI,)
 ALGORITHM = "Ed25519"
 HASH = "SHA-256"
@@ -100,8 +101,8 @@ def require_outside(directory: Path, paths: tuple[Path, ...]) -> None:
     for path in paths:
         if path.resolve().is_relative_to(root):
             raise SealError(
-                f"keys, manifests and trust stores must stay outside the "
-                f"delivery tree: {path}"
+                f"keys, manifests, trust stores, policies and batch files "
+                f"must stay outside the delivery tree: {path}"
             )
 
 
@@ -164,19 +165,80 @@ def valid_record(record: object) -> bool:
     )
 
 
-def _decode_signature(value: object, path: Path, *, field: str) -> bytes:
+_MANIFEST_FIELDS = {1: V1_FIELDS, 2: V2_FIELDS, 3: V3_FIELDS}
+
+
+def validate_manifest_document(document: object, versions: tuple = SUPPORTED_VERSIONS):
+    """Validate a parsed manifest JSON document.
+
+    Returns ``(version, files, signatures, key_id)`` exactly like
+    :func:`load_manifest`: for versions 1 and 2 ``signatures`` is the
+    single decoded signature and ``key_id`` the manifest's key id (``None``
+    on version 1); for version 3 ``signatures`` maps signer key id to
+    decoded signature and ``key_id`` is ``None``. Only the given
+    ``versions`` are accepted. Raises :class:`SealError` on any mismatch.
+    """
+    if not isinstance(document, dict):
+        raise SealError("manifest must be a JSON object")
+    version = document.get("version")
+    if (
+        not isinstance(version, int)
+        or isinstance(version, bool)
+        or version not in versions
+    ):
+        supported = " or ".join(str(value) for value in versions)
+        raise SealError(f"manifest field 'version' must be {supported}")
+    expected = set(_MANIFEST_FIELDS[version])
+    if set(document) != expected:
+        raise SealError(
+            f"manifest version {version} must contain exactly "
+            f"{', '.join(sorted(expected))}"
+        )
+    if document["algorithm"] != ALGORITHM:
+        raise SealError(f"manifest field 'algorithm' must be {ALGORITHM!r}")
+    if document["hash"] != HASH:
+        raise SealError(f"manifest field 'hash' must be {HASH!r}")
+    key_id = None
+    if version == 2:
+        key_id = document["key_id"]
+        if not is_key_id(key_id):
+            raise SealError(
+                "manifest field 'key_id' must be 64 lowercase hex digits"
+            )
+    files = document["files"]
+    if not isinstance(files, list) or any(not valid_record(r) for r in files):
+        raise SealError("manifest field 'files' holds invalid records")
+    paths = [record["path"] for record in files]
+    if len(set(paths)) != len(paths):
+        raise SealError("manifest lists duplicate paths")
+    if version == VERSION_MULTI:
+        signatures = document["signatures"]
+        if not isinstance(signatures, dict) or not signatures:
+            raise SealError(
+                "manifest field 'signatures' must be a non-empty object"
+            )
+        decoded_multi = {}
+        for signer_id, signature in signatures.items():
+            if not is_key_id(signer_id):
+                raise SealError("manifest 'signatures' holds an invalid key id")
+            decoded_multi[signer_id] = _decode_signature_obj(
+                signature, field="'signatures'"
+            )
+        return version, files, decoded_multi, None
+    decoded = _decode_signature_obj(document["signature"], field="'signature'")
+    return version, files, decoded, key_id
+
+
+def _decode_signature_obj(value: object, *, field: str) -> bytes:
     if not isinstance(value, str):
-        raise SealError(f"manifest field {field} must be Base64 text: {path}")
+        raise SealError(f"manifest field {field} must be Base64 text")
     try:
         decoded = base64.b64decode(value, validate=True)
     except (binascii.Error, ValueError) as error:
-        raise SealError(f"manifest signature is not Base64: {path}") from error
+        raise SealError("manifest signature is not Base64") from error
     if len(decoded) != 64:
-        raise SealError(f"manifest signature must be 64 bytes: {path}")
+        raise SealError("manifest signature must be 64 bytes")
     return decoded
-
-
-_MANIFEST_FIELDS = {1: V1_FIELDS, 2: V2_FIELDS, 3: V3_FIELDS}
 
 
 def load_manifest(path: Path, versions: tuple = SUPPORTED_VERSIONS):
@@ -196,59 +258,10 @@ def load_manifest(path: Path, versions: tuple = SUPPORTED_VERSIONS):
         document = json.loads(raw.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError) as error:
         raise SealError(f"manifest is not UTF-8 JSON: {path}: {error}") from error
-    if not isinstance(document, dict):
-        raise SealError(f"manifest must be a JSON object: {path}")
-    version = document.get("version")
-    if (
-        not isinstance(version, int)
-        or isinstance(version, bool)
-        or version not in versions
-    ):
-        supported = " or ".join(str(value) for value in versions)
-        raise SealError(
-            f"manifest field 'version' must be {supported}: {path}"
-        )
-    expected = set(_MANIFEST_FIELDS[version])
-    if set(document) != expected:
-        raise SealError(
-            f"manifest version {version} must contain exactly "
-            f"{', '.join(sorted(expected))}: {path}"
-        )
-    if document["algorithm"] != ALGORITHM:
-        raise SealError(f"manifest field 'algorithm' must be {ALGORITHM!r}: {path}")
-    if document["hash"] != HASH:
-        raise SealError(f"manifest field 'hash' must be {HASH!r}: {path}")
-    key_id = None
-    if version == 2:
-        key_id = document["key_id"]
-        if not is_key_id(key_id):
-            raise SealError(
-                f"manifest field 'key_id' must be 64 lowercase hex digits: {path}"
-            )
-    files = document["files"]
-    if not isinstance(files, list) or any(not valid_record(r) for r in files):
-        raise SealError(f"manifest field 'files' holds invalid records: {path}")
-    paths = [record["path"] for record in files]
-    if len(set(paths)) != len(paths):
-        raise SealError(f"manifest lists duplicate paths: {path}")
-    if version == VERSION_MULTI:
-        signatures = document["signatures"]
-        if not isinstance(signatures, dict) or not signatures:
-            raise SealError(
-                f"manifest field 'signatures' must be a non-empty object: {path}"
-            )
-        decoded_multi = {}
-        for signer_id, signature in signatures.items():
-            if not is_key_id(signer_id):
-                raise SealError(
-                    f"manifest 'signatures' holds an invalid key id: {path}"
-                )
-            decoded_multi[signer_id] = _decode_signature(
-                signature, path, field="'signatures'"
-            )
-        return version, files, decoded_multi, None
-    decoded = _decode_signature(document["signature"], path, field="'signature'")
-    return version, files, decoded, key_id
+    try:
+        return validate_manifest_document(document, versions)
+    except SealError as error:
+        raise SealError(f"{error}: {path}") from error
 
 
 def diff_inventory(expected: list[dict], actual: list[dict]) -> tuple[list, list, list]:
@@ -266,69 +279,146 @@ def diff_inventory(expected: list[dict], actual: list[dict]) -> tuple[list, list
     return modified, missing, unexpected
 
 
-def _looks_like_manifest(document: dict) -> bool:
-    keys = set(document)
-    if keys in (set(V1_FIELDS), set(V2_FIELDS), set(V3_FIELDS)):
-        return document.get("algorithm") == ALGORITHM
-    return False
+def _looks_like_pem_key(data: bytes) -> bool:
+    """Whether ``data`` is a real PEM key that must stay out of the tree.
+
+    Probing is purely by content and independent of the file name. The
+    bytes are tried, in order, with :func:`load_pem_public_key` and then
+    :func:`load_pem_private_key` with ``password=None``:
+
+    * a successful load of either kind, for any algorithm (Ed25519, RSA,
+      EC, ...), marks a real key;
+    * the explicit ``TypeError`` reporting that an encrypted private key
+      needs a password marks a real (encrypted) key;
+    * every other failure (certificates and other non-key PEM, malformed
+      armor, DER, OpenSSH, PKCS#12, plain text) means the file is not a
+      PEM key and stays deliverable.
+    """
+    try:
+        load_pem_public_key(data)
+    except Exception:
+        pass
+    else:
+        return True
+    try:
+        load_pem_private_key(data, password=None)
+    except TypeError as error:
+        # The only TypeError expected with password=None is the explicit
+        # "Password was not given but private key is encrypted": treat
+        # only that clear encrypted-key report as a forbidden key.
+        if "encrypted" in str(error).lower() and "password" in str(error).lower():
+            return True
+        return False
+    except Exception:
+        return False
+    return True
 
 
-def _looks_like_trust_store(document: dict) -> bool:
-    return document.get("kind") == TRUST_STORE_KIND and "keys" in document
+def _forbidden_json_document(document: object) -> str | None:
+    """Rejection message for a parsed JSON object, or ``None`` if deliverable.
+
+    Only a document that *fully* validates as a version 1/2/3 manifest, a
+    version 1 trust store or a three-field version 1 policy is forbidden.
+    A merely similar object (right field names but invalid values, a
+    foreign ``kind`` or ``version``) passes. Imports live here to avoid an
+    import cycle: ``trust`` and ``policy`` import from this module.
+    """
+    if not isinstance(document, dict):
+        return None
+    try:
+        validate_manifest_document(document, ALL_MANIFEST_VERSIONS)
+    except SealError:
+        pass
+    else:
+        return "manifests must stay outside the delivery tree"
+    from .trust import validate_store_document
+
+    try:
+        validate_store_document(document)
+    except SealError:
+        pass
+    else:
+        return "trust stores must stay outside the delivery tree"
+    from .policy import validate_policy_document
+
+    try:
+        validate_policy_document(document)
+    except SealError:
+        return None
+    return "policies must stay outside the delivery tree"
 
 
-def _looks_like_policy(document: dict) -> bool:
-    return set(document) == set(POLICY_FIELDS)
+_PEM_MARKER = b"-----BEGIN"
+_JSON_WHITESPACE = b" \t\r\n"
 
 
-def _read_nofollow(path: Path, max_bytes: int | None = None) -> bytes:
-    """Read a regular file without ever following a swapped-in symlink."""
+def _scan_forbidden_kind(path: Path) -> tuple[str, bytes] | None:
+    """Stream a file once to see whether it may hold PEM or JSON content.
+
+    Returns ``("pem", data)`` when a ``-----BEGIN`` marker appears
+    anywhere, ``("json", data)`` when the first non-whitespace byte opens
+    a JSON object, and ``None`` for an ordinary file. The full bytes are
+    buffered only for the two interesting kinds, so a large plain binary
+    is scanned with constant memory rather than read whole. Reads never
+    follow a swapped-in symlink (``O_NOFOLLOW``).
+    """
     flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
     try:
         fd = os.open(path, flags)
     except OSError as error:
         raise SealError(f"cannot read {path}: {error}") from error
+    first_non_ws: int | None = None
+    marker_seen = False
+    overlap = b""
     with os.fdopen(fd, "rb") as source:
-        if max_bytes is None:
-            return source.read()
-        return source.read(max_bytes)
+        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+            if first_non_ws is None:
+                for byte in chunk:
+                    if byte not in _JSON_WHITESPACE:
+                        first_non_ws = byte
+                        break
+            window = overlap + chunk
+            if _PEM_MARKER in window:
+                marker_seen = True
+            overlap = window[-len(_PEM_MARKER) + 1:]
+        if marker_seen:
+            source.seek(0)
+            return "pem", source.read()
+        # Every forbidden JSON document (manifest/store/policy) is an
+        # object, so a non-object start is never worth buffering.
+        if first_non_ws == ord("{"):
+            source.seek(0)
+            return "json", source.read()
+    return None
 
 
 def reject_forbidden_files(directory: Path, files: list[dict]) -> None:
     """Reject keys, manifests, trust stores or policies inside the tree.
 
-    Detection is by content, not by name: an ordinary ``.pem`` or
-    ``.json`` file is deliverable, while a real PEM key block or a JSON
-    document structurally matching a manifest, trust store or policy is
-    refused whatever its file name.
+    Detection is by content, not by name or extension. A file is refused
+    when its bytes load as a PEM key of any algorithm (or clearly are an
+    encrypted PEM private key missing its password), or when they parse as
+    UTF-8 JSON fully validating as a version 1/2/3 manifest, a version 1
+    trust store or a three-field version 1 policy. Certificates, ordinary
+    PEM, DER/OpenSSH/PKCS#12 blobs and malformed-but-similar JSON are all
+    deliverable, whatever the file is called.
     """
     for record in files:
         rel = record["path"]
         path = directory / rel
-        name = rel.rsplit("/", 1)[-1].lower()
-        prefix = _read_nofollow(path, 256).lstrip()
-        if prefix.startswith(b"-----BEGIN ") and b"KEY-----" in prefix[:80]:
+        kind = _scan_forbidden_kind(path)
+        if kind is None:
+            continue
+        flavor, data = kind
+        if flavor == "pem" and _looks_like_pem_key(data):
             raise SealError(f"keys must stay outside the delivery tree: {path}")
-        if not name.endswith(".json"):
-            continue
         try:
-            document = json.loads(_read_nofollow(path).decode("utf-8"))
-        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            document = json.loads(data.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
             continue
-        if not isinstance(document, dict):
-            continue
-        if _looks_like_manifest(document):
-            raise SealError(
-                f"manifests must stay outside the delivery tree: {path}"
-            )
-        if _looks_like_trust_store(document):
-            raise SealError(
-                f"trust stores must stay outside the delivery tree: {path}"
-            )
-        if _looks_like_policy(document):
-            raise SealError(
-                f"policies must stay outside the delivery tree: {path}"
-            )
+        message = _forbidden_json_document(document)
+        if message is not None:
+            raise SealError(f"{message}: {path}")
 
 
 def guarded_inventory(directory: Path) -> list[dict]:
