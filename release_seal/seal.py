@@ -1,19 +1,26 @@
 """Sign and verify a directory inventory with Ed25519.
 
-Manifests exist in three versions:
+Manifests exist in four versions:
 
 * version 1 holds ``version``, ``algorithm``, ``hash``, ``files`` and
   ``signature``;
 * version 2 adds ``key_id``, the lowercase SHA-256 hex of the signer's
   DER SubjectPublicKeyInfo;
 * version 3 replaces ``signature`` with ``signatures``, an object keyed
-  by signer ``key_id`` holding one Base64 signature per key.
+  by signer ``key_id`` holding one Base64 signature per key;
+* version 4 is an incremental manifest (a *delta*): it holds
+  ``version``, ``algorithm``, ``hash``, ``key_id``, ``base_sha256``,
+  ``changes``, ``removed`` and ``signature``, where ``changes`` lists
+  added/modified inventory records relative to a version 2 base and
+  ``removed`` lists deleted paths.
 
-The signature covers every field except ``signature`` (versions 1 and
-2) or ``signatures`` (version 3), serialized with keys sorted, no
+The signature covers every field except ``signature`` (versions 1, 2
+and 4) or ``signatures`` (version 3), serialized with keys sorted, no
 whitespace and no Unicode escaping. ``verify`` accepts versions 1 and
-2; ``sign`` always emits version 2. Version 3 manifests are produced
-by ``sign-multi`` and checked by ``verify-policy``.
+2; ``sign`` always emits version 2. Version 3 manifests are produced by
+``sign-multi`` and checked by ``verify-policy``. Version 4 deltas are
+produced by ``sign-incremental`` and checked by
+``verify-incremental``.
 """
 
 import base64
@@ -42,7 +49,9 @@ from .inventory import inventory, stat_snapshot
 VERSION = 1
 VERSION_CURRENT = 2
 VERSION_MULTI = 3
+VERSION_INCREMENTAL = 4
 SUPPORTED_VERSIONS = (1, 2)
+BASE_VERSIONS = (VERSION_CURRENT,)
 ALL_MANIFEST_VERSIONS = (1, 2, 3)
 MULTI_VERSIONS = (VERSION_MULTI,)
 ALGORITHM = "Ed25519"
@@ -51,6 +60,16 @@ TRUST_STORE_KIND = "release-seal-trust-store"
 V1_FIELDS = ("version", "algorithm", "hash", "files", "signature")
 V2_FIELDS = ("version", "algorithm", "hash", "key_id", "files", "signature")
 V3_FIELDS = ("version", "algorithm", "hash", "files", "signatures")
+V4_FIELDS = (
+    "version",
+    "algorithm",
+    "hash",
+    "key_id",
+    "base_sha256",
+    "changes",
+    "removed",
+    "signature",
+)
 POLICY_FIELDS = ("version", "threshold", "allowed_key_ids")
 
 _PUBLIC_PEM_MARKERS = (b"-----BEGIN PUBLIC KEY-----", b"-----END PUBLIC KEY-----")
@@ -94,6 +113,155 @@ def canonical_payload(version: int, key_id: str | None, files: list[dict]) -> by
     return json.dumps(
         body, ensure_ascii=False, sort_keys=True, separators=(",", ":")
     ).encode("utf-8")
+
+
+def canonical_delta_payload(
+    key_id: str,
+    base_sha256: str,
+    changes: list[dict],
+    removed: list[str],
+) -> bytes:
+    """Return the canonical UTF-8 JSON a version 4 signature covers.
+
+    The body holds every delta field except ``signature`` —
+    ``version``, ``algorithm``, ``hash``, ``key_id``, ``base_sha256``,
+    ``changes`` and ``removed`` — serialized with the same rules as the
+    version 2 body: keys sorted, no whitespace and no Unicode escaping.
+    """
+    body = {
+        "version": VERSION_INCREMENTAL,
+        "algorithm": ALGORITHM,
+        "hash": HASH,
+        "key_id": key_id,
+        "base_sha256": base_sha256,
+        "changes": changes,
+        "removed": removed,
+    }
+    return json.dumps(
+        body, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+
+
+def _is_sorted_strings(values: list[str]) -> bool:
+    return all(values[index] < values[index + 1] for index in range(len(values) - 1))
+
+
+def validate_delta_document(document: object):
+    """Strictly validate a parsed version 4 delta document.
+
+    Returns ``(key_id, base_sha256, changes, removed, signature)`` with
+    the signature Base64-decoded. The document must hold exactly the
+    eight version 4 fields; ``changes`` must be inventory records sorted
+    by unique path and ``removed`` sorted, unique and disjoint from
+    ``changes``. Raises :class:`SealError` on any mismatch.
+    """
+    if not isinstance(document, dict):
+        raise SealError("delta manifest must be a JSON object")
+    if set(document) != set(V4_FIELDS):
+        raise SealError(
+            "delta manifest must contain exactly "
+            + ", ".join(sorted(V4_FIELDS))
+        )
+    version = document["version"]
+    if (
+        not isinstance(version, int)
+        or isinstance(version, bool)
+        or version != VERSION_INCREMENTAL
+    ):
+        raise SealError(
+            f"delta manifest field 'version' must be {VERSION_INCREMENTAL}"
+        )
+    if document["algorithm"] != ALGORITHM:
+        raise SealError(f"delta manifest field 'algorithm' must be {ALGORITHM!r}")
+    if document["hash"] != HASH:
+        raise SealError(f"delta manifest field 'hash' must be {HASH!r}")
+    key_id = document["key_id"]
+    if not is_key_id(key_id):
+        raise SealError(
+            "delta manifest field 'key_id' must be 64 lowercase hex digits"
+        )
+    base_sha256 = document["base_sha256"]
+    if not is_key_id(base_sha256):
+        raise SealError(
+            "delta manifest field 'base_sha256' must be 64 lowercase hex digits"
+        )
+    changes = document["changes"]
+    if not isinstance(changes, list) or any(not valid_record(r) for r in changes):
+        raise SealError("delta manifest field 'changes' holds invalid records")
+    change_paths = [record["path"] for record in changes]
+    if len(set(change_paths)) != len(change_paths):
+        raise SealError("delta manifest lists duplicate change paths")
+    if not _is_sorted_strings(change_paths):
+        raise SealError("delta manifest field 'changes' must be sorted by path")
+    removed = document["removed"]
+    if not isinstance(removed, list) or any(
+        not isinstance(path, str) or path == "" for path in removed
+    ):
+        raise SealError(
+            "delta manifest field 'removed' must be a list of non-empty strings"
+        )
+    if len(set(removed)) != len(removed):
+        raise SealError("delta manifest lists duplicate removed paths")
+    if not _is_sorted_strings(removed):
+        raise SealError("delta manifest field 'removed' must be sorted")
+    if set(change_paths) & set(removed):
+        raise SealError(
+            "delta manifest 'removed' paths must not overlap 'changes'"
+        )
+    signature = _decode_signature_obj(document["signature"], field="'signature'")
+    return key_id, base_sha256, changes, removed, signature
+
+
+def _read_json_bytes(path: Path, *, noun: str) -> tuple[bytes, object]:
+    """Read path and parse it as UTF-8 JSON, labelling errors with noun."""
+    try:
+        raw = path.read_bytes()
+    except OSError as error:
+        raise SealError(f"cannot read {noun} {path}: {error}") from error
+    try:
+        document = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise SealError(f"{noun} is not UTF-8 JSON: {path}: {error}") from error
+    return raw, document
+
+
+def load_base_manifest(path: Path):
+    """Return ``(raw, files, signature, key_id)`` for a version 2 base.
+
+    The raw bytes are returned so callers can hash them for
+    ``base_sha256``; only version 2 manifests are accepted as a base.
+    """
+    raw, document = _read_json_bytes(path, noun="base manifest")
+    try:
+        version, files, signature, key_id = validate_manifest_document(
+            document, BASE_VERSIONS
+        )
+    except SealError as error:
+        raise SealError(f"{error}: {path}") from error
+    return raw, files, signature, key_id
+
+
+def load_delta_manifest(path: Path):
+    """Return the validated tuple from :func:`validate_delta_document`."""
+    _, document = _read_json_bytes(path, noun="delta manifest")
+    try:
+        return validate_delta_document(document)
+    except SealError as error:
+        raise SealError(f"{error}: {path}") from error
+
+
+def apply_delta(base_files: list[dict], changes: list[dict], removed: list[str]):
+    """Apply a delta to base records, returning the expected full inventory.
+
+    ``changes`` replace or add records by path; ``removed`` drops paths.
+    The result is sorted by path, exactly like :func:`inventory`.
+    """
+    merged = {record["path"]: record for record in base_files}
+    for path in removed:
+        merged.pop(path, None)
+    for record in changes:
+        merged[record["path"]] = record
+    return sorted(merged.values(), key=lambda record: str(record["path"]))
 
 
 def require_outside(directory: Path, paths: tuple[Path, ...]) -> None:
@@ -318,11 +486,11 @@ def _forbidden_json_document(document: object) -> str | None:
     """Rejection message for a parsed JSON object, or ``None`` if deliverable.
 
     Only a document that *fully* validates as a version 1/2/3 manifest, a
-    version 1 trust store, a three-field version 1 policy or a version 1
-    audit report is forbidden. A merely similar object (right field names
-    but invalid values, a foreign ``kind`` or ``version``) passes. Imports
-    live here to avoid an import cycle: ``trust``, ``policy`` and
-    ``audit`` import from this module.
+    version 4 delta manifest, a version 1 trust store, a three-field
+    version 1 policy or a version 1 audit report is forbidden. A merely
+    similar object (right field names but invalid values, a foreign
+    ``kind`` or ``version``) passes. Imports live here to avoid an import
+    cycle: ``trust``, ``policy`` and ``audit`` import from this module.
     """
     if not isinstance(document, dict):
         return None
@@ -332,6 +500,12 @@ def _forbidden_json_document(document: object) -> str | None:
         pass
     else:
         return "manifests must stay outside the delivery tree"
+    try:
+        validate_delta_document(document)
+    except SealError:
+        pass
+    else:
+        return "delta manifests must stay outside the delivery tree"
     from .trust import validate_store_document
 
     try:
@@ -407,11 +581,11 @@ def reject_forbidden_files(directory: Path, files: list[dict]) -> None:
     Detection is by content, not by name or extension. A file is refused
     when its bytes load as a PEM key of any algorithm (or clearly are an
     encrypted PEM private key missing its password), or when they parse as
-    UTF-8 JSON fully validating as a version 1/2/3 manifest, a version 1
-    trust store, a three-field version 1 policy or a version 1 audit
-    report. Certificates, ordinary PEM, DER/OpenSSH/PKCS#12 blobs and
-    malformed-but-similar JSON are all deliverable, whatever the file is
-    called.
+    UTF-8 JSON fully validating as a version 1/2/3 manifest, a version 4
+    delta manifest, a version 1 trust store, a three-field version 1
+    policy or a version 1 audit report. Certificates, ordinary PEM,
+    DER/OpenSSH/PKCS#12 blobs and malformed-but-similar JSON are all
+    deliverable, whatever the file is called.
     """
     for record in files:
         rel = record["path"]
@@ -635,6 +809,127 @@ def verify_directory(directory, manifest, public_key) -> dict:
         return {"valid": False, "modified": [], "missing": [], "unexpected": []}
     modified, missing, unexpected = diff_inventory(
         files, guarded_inventory(directory)
+    )
+    if modified or missing or unexpected:
+        return {
+            "valid": False,
+            "modified": modified,
+            "missing": missing,
+            "unexpected": unexpected,
+        }
+    return {"valid": True}
+
+
+def _empty_invalid() -> dict:
+    return {"valid": False, "modified": [], "missing": [], "unexpected": []}
+
+
+def sign_incremental_directory(directory, private_key, base, delta) -> dict:
+    """Sign the inventory changes of directory relative to a version 2 base.
+
+    Emits a version 4 delta listing records added or modified since BASE
+    (``changes``, sorted by path) and paths present in BASE but missing
+    from the directory (``removed``, sorted and unique); an empty delta
+    is legal. ``base_sha256`` is the lowercase SHA-256 hex of BASE's raw
+    bytes. BASE must be a version 2 manifest whose signature verifies
+    under the given private key. The delta is published without
+    overwriting, exactly like ``sign``.
+    """
+    directory = Path(directory)
+    private_key = Path(private_key)
+    base = Path(base)
+    delta = Path(delta)
+    require_outside(directory, (private_key, base, delta))
+    key = load_private_key(private_key)
+    public = key.public_key()
+    signer_id = key_id_of(public)
+    base_raw, base_files, base_signature, base_key_id = load_base_manifest(base)
+    if base_key_id != signer_id:
+        raise SealError(
+            f"base manifest key_id {base_key_id} does not match the "
+            f"given private key {signer_id}: {base}"
+        )
+    try:
+        public.verify(
+            base_signature, canonical_payload(VERSION_CURRENT, base_key_id, base_files)
+        )
+    except InvalidSignature as error:
+        raise SealError(f"base manifest signature is invalid: {base}") from error
+    base_sha256 = hashlib.sha256(base_raw).hexdigest()
+    current = guarded_inventory(directory)
+    base_by_path = {record["path"]: record for record in base_files}
+    current_paths = {record["path"] for record in current}
+    changes = [
+        record for record in current if base_by_path.get(record["path"]) != record
+    ]
+    removed = sorted(base_by_path.keys() - current_paths)
+    signature = base64.b64encode(
+        key.sign(canonical_delta_payload(signer_id, base_sha256, changes, removed))
+    ).decode("ascii")
+    document = {
+        "version": VERSION_INCREMENTAL,
+        "algorithm": ALGORITHM,
+        "hash": HASH,
+        "key_id": signer_id,
+        "base_sha256": base_sha256,
+        "changes": changes,
+        "removed": removed,
+        "signature": signature,
+    }
+    data = (json.dumps(document, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
+    publish_new(delta, data, hint="delta-manifest", noun="delta manifest")
+    return document
+
+
+def verify_incremental_directory(directory, base, delta, public_key) -> dict:
+    """Verify a version 4 delta against BASE and directory using one key.
+
+    Only the PEM Ed25519 public key on the command line is trusted.
+    BASE's and DELTA's structure, key ids, the ``base_sha256`` digest and
+    both signatures are checked first; only then is the directory
+    inventoried and compared against BASE with the delta applied. Any
+    trust or file mismatch returns ``valid: false`` (exit 1); malformed
+    inputs or I/O/scan problems raise :class:`SealError` (exit 2).
+    """
+    directory = Path(directory)
+    base = Path(base)
+    delta = Path(delta)
+    public_key = Path(public_key)
+    require_outside(directory, (base, delta, public_key))
+    key = load_public_key(public_key)
+    trusted_id = key_id_of(key)
+    base_raw, base_files, base_signature, base_key_id = load_base_manifest(base)
+    (
+        delta_key_id,
+        base_sha256,
+        changes,
+        removed,
+        delta_signature,
+    ) = load_delta_manifest(delta)
+    if base_sha256 != hashlib.sha256(base_raw).hexdigest():
+        return _empty_invalid()
+    if base_key_id != trusted_id:
+        return _empty_invalid()
+    try:
+        key.verify(
+            base_signature, canonical_payload(VERSION_CURRENT, base_key_id, base_files)
+        )
+    except InvalidSignature:
+        return _empty_invalid()
+    if delta_key_id != trusted_id:
+        return _empty_invalid()
+    try:
+        key.verify(
+            delta_signature,
+            canonical_delta_payload(
+                delta_key_id, base_sha256, changes, removed
+            ),
+        )
+    except InvalidSignature:
+        return _empty_invalid()
+    expected = apply_delta(base_files, changes, removed)
+    modified, missing, unexpected = diff_inventory(
+        expected, guarded_inventory(directory)
     )
     if modified or missing or unexpected:
         return {

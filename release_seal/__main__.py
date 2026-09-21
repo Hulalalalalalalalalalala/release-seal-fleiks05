@@ -86,12 +86,28 @@ def main() -> int:
     multi.add_argument(
         "private", nargs="+", help="PEM Ed25519 private keys (read only)"
     )
+    sign_delta = commands.add_parser(
+        "sign-incremental",
+        help="sign changes relative to a version 2 manifest (version 4 delta)",
+    )
+    sign_delta.add_argument("directory", help="directory to read")
+    sign_delta.add_argument("private", help="PEM Ed25519 private key (read only)")
+    sign_delta.add_argument("base", help="version 2 base manifest (read only)")
+    sign_delta.add_argument("delta", help="delta manifest to create; must not exist yet")
     checking = commands.add_parser(
         "verify", help="verify a signed manifest against a directory"
     )
     checking.add_argument("directory", help="directory to check")
     checking.add_argument("manifest", help="signed manifest to trust")
     checking.add_argument("public", help="PEM Ed25519 public key to trust")
+    verify_delta = commands.add_parser(
+        "verify-incremental",
+        help="verify a version 4 delta against a base manifest and directory",
+    )
+    verify_delta.add_argument("directory", help="directory to check")
+    verify_delta.add_argument("base", help="version 2 base manifest to trust")
+    verify_delta.add_argument("delta", help="version 4 delta manifest to verify")
+    verify_delta.add_argument("public", help="PEM Ed25519 public key to trust")
     trusted = commands.add_parser(
         "verify-trusted",
         help="verify a manifest using keys in an offline trust store",
@@ -157,10 +173,24 @@ def main() -> int:
                 args.directory, args.manifest, args.private
             )
             code = 0
+        elif args.command == "sign-incremental":
+            from .seal import sign_incremental_directory
+
+            result = sign_incremental_directory(
+                args.directory, args.private, args.base, args.delta
+            )
+            code = 0
         elif args.command == "verify":
             from .seal import verify_directory
 
             result = verify_directory(args.directory, args.manifest, args.public)
+            code = 0 if result["valid"] else 1
+        elif args.command == "verify-incremental":
+            from .seal import verify_incremental_directory
+
+            result = verify_incremental_directory(
+                args.directory, args.base, args.delta, args.public
+            )
             code = 0 if result["valid"] else 1
         elif args.command == "verify-trusted":
             from .trust import verify_trusted
