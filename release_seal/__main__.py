@@ -92,6 +92,26 @@ def main() -> int:
     checking.add_argument("directory", help="directory to check")
     checking.add_argument("manifest", help="signed manifest to trust")
     checking.add_argument("public", help="PEM Ed25519 public key to trust")
+    inc_sign = commands.add_parser(
+        "sign-incremental",
+        help="sign a version 4 delta manifest against a version 2 base",
+    )
+    inc_sign.add_argument("directory", help="directory to read")
+    inc_sign.add_argument("private", help="PEM Ed25519 private key (read only)")
+    inc_sign.add_argument(
+        "base", help="version 2 base manifest signed by the same key"
+    )
+    inc_sign.add_argument(
+        "delta", help="delta manifest to create; must not exist yet"
+    )
+    inc_verify = commands.add_parser(
+        "verify-incremental",
+        help="verify a directory against a base manifest plus a delta",
+    )
+    inc_verify.add_argument("directory", help="directory to check")
+    inc_verify.add_argument("base", help="version 2 base manifest to trust")
+    inc_verify.add_argument("delta", help="version 4 delta manifest to trust")
+    inc_verify.add_argument("public", help="PEM Ed25519 public key to trust")
     trusted = commands.add_parser(
         "verify-trusted",
         help="verify a manifest using keys in an offline trust store",
@@ -161,6 +181,20 @@ def main() -> int:
             from .seal import verify_directory
 
             result = verify_directory(args.directory, args.manifest, args.public)
+            code = 0 if result["valid"] else 1
+        elif args.command == "sign-incremental":
+            from .incremental import sign_incremental_directory
+
+            result = sign_incremental_directory(
+                args.directory, args.private, args.base, args.delta
+            )
+            code = 0
+        elif args.command == "verify-incremental":
+            from .incremental import verify_incremental
+
+            result = verify_incremental(
+                args.directory, args.base, args.delta, args.public
+            )
             code = 0 if result["valid"] else 1
         elif args.command == "verify-trusted":
             from .trust import verify_trusted

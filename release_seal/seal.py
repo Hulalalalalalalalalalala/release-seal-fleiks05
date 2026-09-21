@@ -318,11 +318,12 @@ def _forbidden_json_document(document: object) -> str | None:
     """Rejection message for a parsed JSON object, or ``None`` if deliverable.
 
     Only a document that *fully* validates as a version 1/2/3 manifest, a
-    version 1 trust store, a three-field version 1 policy or a version 1
-    audit report is forbidden. A merely similar object (right field names
-    but invalid values, a foreign ``kind`` or ``version``) passes. Imports
-    live here to avoid an import cycle: ``trust``, ``policy`` and
-    ``audit`` import from this module.
+    version 4 delta manifest, a version 1 trust store, a three-field
+    version 1 policy or a version 1 audit report is forbidden. A merely
+    similar object (right field names but invalid values, a foreign
+    ``kind`` or ``version``) passes. Imports live here to avoid an import
+    cycle: ``trust``, ``policy``, ``audit`` and ``incremental`` import
+    from this module.
     """
     if not isinstance(document, dict):
         return None
@@ -332,6 +333,14 @@ def _forbidden_json_document(document: object) -> str | None:
         pass
     else:
         return "manifests must stay outside the delivery tree"
+    from .incremental import validate_delta_document
+
+    try:
+        validate_delta_document(document)
+    except SealError:
+        pass
+    else:
+        return "delta manifests must stay outside the delivery tree"
     from .trust import validate_store_document
 
     try:
@@ -402,16 +411,16 @@ def _scan_forbidden_kind(path: Path) -> tuple[str, bytes] | None:
 
 
 def reject_forbidden_files(directory: Path, files: list[dict]) -> None:
-    """Reject keys, manifests, stores, policies or audit reports in the tree.
+    """Reject keys, manifests, stores, policies, deltas or audit reports.
 
     Detection is by content, not by name or extension. A file is refused
     when its bytes load as a PEM key of any algorithm (or clearly are an
     encrypted PEM private key missing its password), or when they parse as
-    UTF-8 JSON fully validating as a version 1/2/3 manifest, a version 1
-    trust store, a three-field version 1 policy or a version 1 audit
-    report. Certificates, ordinary PEM, DER/OpenSSH/PKCS#12 blobs and
-    malformed-but-similar JSON are all deliverable, whatever the file is
-    called.
+    UTF-8 JSON fully validating as a version 1/2/3 manifest, a version 4
+    delta manifest, a version 1 trust store, a three-field version 1
+    policy or a version 1 audit report. Certificates, ordinary PEM,
+    DER/OpenSSH/PKCS#12 blobs and malformed-but-similar JSON are all
+    deliverable, whatever the file is called.
     """
     for record in files:
         rel = record["path"]
@@ -438,8 +447,8 @@ def guarded_inventory(directory: Path) -> list[dict]:
     ``(dev, ino)`` identity, sizes and nanosecond mtimes. Every content
     read (hashing and forbidden-file classification) happens between the
     two snapshots, so a swapped or modified file is always caught. The
-    tree is also refused if it contains keys, manifests, trust stores,
-    policies or audit reports.
+    tree is also refused if it contains keys, manifests, delta manifests,
+    trust stores, policies or audit reports.
     """
     before = stat_snapshot(directory)
     files = inventory(directory)

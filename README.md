@@ -1,13 +1,15 @@
 # Release Seal
 
-为本地文件交付目录生成可读的文件清单，并用 Ed25519 签名实现可信的离线交付。需要 Python 3.10 或更高版本；`inventory` 仅依赖标准库，`sign`、`sign-multi`、`verify`、`trust`、`verify-trusted`、`verify-policy`、`verify-batch`、`audit-batch` 和 `demo` 需要 `cryptography` 包。
+为本地文件交付目录生成可读的文件清单，并用 Ed25519 签名实现可信的离线交付。需要 Python 3.10 或更高版本；`inventory` 仅依赖标准库，`sign`、`sign-multi`、`sign-incremental`、`verify`、`verify-incremental`、`trust`、`verify-trusted`、`verify-policy`、`verify-batch`、`audit-batch` 和 `demo` 需要 `cryptography` 包。
 
 ```sh
 python3 -m release_seal --help
 python3 -m release_seal inventory examples/package
 python3 -m release_seal sign examples/package private.pem manifest.json
 python3 -m release_seal sign-multi examples/package manifest.json a-private.pem b-private.pem
+python3 -m release_seal sign-incremental examples/package private.pem manifest.json delta.json
 python3 -m release_seal verify examples/package manifest.json public.pem
+python3 -m release_seal verify-incremental examples/package manifest.json delta.json public.pem
 python3 -m release_seal trust import public.pem trust.json
 python3 -m release_seal trust revoke trust.json KEY_ID "key compromised"
 python3 -m release_seal verify-trusted examples/package manifest.json trust.json
@@ -37,6 +39,22 @@ python3 -m unittest discover -s tests -v
 版本 3 清单固定包含五个字段：`version`（`3`）、`algorithm`、`hash`、`files` 和 `signatures`。`signatures` 是按 `key_id` 排序的对象，每个签名者的 `key_id` 映射到它的 Base64 签名；每把私钥签的都是**除 `signatures` 外的完整规范化清单**（规范化规则与版本 1/2 相同）。密钥列表不能为空，不允许重复（按 `key_id` 判断）或非 Ed25519 私钥，违反时返回 2 且不产生清单。
 
 `verify` 与 `verify-trusted` 只接受版本 1/2 清单；版本 3 清单请用 `verify-policy` 校验。
+
+## sign-incremental：增量清单（版本 4）
+
+`sign-incremental DIRECTORY PRIVATE BASE DELTA` 以一份**该私钥可验的版本 2 清单** BASE 为基准盘点当前目录，只把相对 BASE 的新增/修改记录和删除路径写入 DELTA；BASE 不是版本 2、签名者不是该私钥或签名无效时返回 2，不产生增量。空增量（无新增/修改、无删除）合法。
+
+版本 4 增量清单恰好包含八个字段：`version`（`4`）、`algorithm`、`hash`、`key_id`、`base_sha256`、`changes`、`removed` 和 `signature`。`base_sha256` 是 BASE 文件原始字节的 SHA-256 小写十六进制；`changes` 是按 `path` 排序的 inventory 记录；`removed` 是排序唯一、且不与 `changes` 重叠的路径。`signature` 覆盖其余全部字段，规范化规则与版本 2 相同。DELTA 沿用 `sign` 的不覆盖原子发布：目标已存在时返回 2，绝不覆盖或截断。
+
+## verify-incremental
+
+`verify-incremental DIRECTORY BASE DELTA PUBLIC` 只信任命令行指定的 PEM Ed25519 公钥：先校验 BASE（版本 2）与 DELTA（版本 4）的结构，再核对两者的 `key_id` 与该公钥一致、DELTA 的 `base_sha256` 与 BASE 原始字节一致、两份签名均有效；然后把增删应用到 BASE 的文件清单上，按规则重新盘点目录并比对。
+
+- 完全一致：输出 `{"valid": true}`，返回 0。
+- 公钥不符、摘要或签名无效、文件被篡改、缺失或多余：输出 `valid:false`；文件差异仍给出按路径排序的 `modified`、`missing`、`unexpected`，返回 1。
+- 格式、I/O、路径冲突（BASE、DELTA、密钥位于交付树内）或扫描期间目录变化：原因写标准错误，返回 2。
+
+合法的版本 4 增量清单按内容识别、禁止放在交付树内（不看文件名）；形似但无法完整校验通过的 JSON 可以交付。
 
 ## verify
 
@@ -103,10 +121,10 @@ REPORT 必须位于所有交付树之外且绝不覆盖已有文件：先在目�
 
 ## 扫描一致性与目录限制
 
-所有命令沿用相同的目录限制：输入必须是目录，目录树不支持符号链接和特殊文件（读取文件时使用 `O_NOFOLLOW`，防止检查后被换成符号链接）。私钥、公钥、清单、信任库、策略、BATCH 文件和审计报告不得位于交付目录内——既包括命令行参数，也包括盘点时在交付树中发现的同类文件。树内识别**只看内容、不看文件名或扩展名**。
+所有命令沿用相同的目录限制：输入必须是目录，目录树不支持符号链接和特殊文件（读取文件时使用 `O_NOFOLLOW`，防止检查后被换成符号链接）。私钥、公钥、清单、增量清单、信任库、策略、BATCH 文件和审计报告不得位于交付目录内——既包括命令行参数，也包括盘点时在交付树中发现的同类文件。树内识别**只看内容、不看文件名或扩展名**。
 
 - **密钥（PEM）**：文件内容依次尝试 `load_pem_public_key` 与 `load_pem_private_key(password=None)`；任意算法（Ed25519、RSA、EC 等）只要其中一个加载成功，或者私钥加载明确报告"加密私钥缺少密码"，都判定为真实密钥而拒绝。证书（`CERTIFICATE`）、普通文本、畸形 PEM 装甲不是密钥，可以交付。DER、OpenSSH 与 PKCS#12 不做检查，一律可以交付。
-- **JSON 文档**：只有能被**完整校验通过**的文档才被拒绝——版本 1/2/3 清单、版本 1 信任库、恰好三字段的版本 1 策略，或版本 1 审计报告。字段名相似但取值非法（如签名长度不对、版本号不符、算法不符、阈值非法、多/少字段、`kind` 不符、汇总计数与逐项结果不一致等）的"形似"文档**可以交付**。无法解析为 UTF-8 JSON 的字节也可以交付。扩展名不限：真实文档无论叫什么名字都拒绝，形似对象即使叫 `.json` 也放行。
+- **JSON 文档**：只有能被**完整校验通过**的文档才被拒绝——版本 1/2/3 清单、版本 4 增量清单、版本 1 信任库、恰好三字段的版本 1 策略，或版本 1 审计报告。字段名相似但取值非法（如签名长度不对、版本号不符、算法不符、阈值非法、多/少字段、`removed` 未排序或与 `changes` 重叠、`kind` 不符、汇总计数与逐项结果不一致等）的"形似"文档**可以交付**。无法解析为 UTF-8 JSON 的字节也可以交付。扩展名不限：真实文档无论叫什么名字都拒绝，形似对象即使叫 `.json` 也放行。
 
 签名或验证前后各取一次身份快照，核对路径、类型、文件身份 `(dev, ino)`、大小和纳秒修改时间；任何变化都返回 2，不产出清单，也不会把验证报告为成功。命令不会修改交付文件。读取失败时向标准错误输出原因，返回状态码 2。生成或验证过程中应保持输入目录不变。
 
