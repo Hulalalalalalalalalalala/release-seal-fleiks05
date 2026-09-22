@@ -3,10 +3,10 @@
 A BATCH is a UTF-8 JSON array; every item has exactly three fields:
 
 * ``id`` — a unique, non-empty string naming the item in the report;
-* ``command`` — one of ``verify``, ``verify-trusted`` or
-  ``verify-policy``;
+* ``command`` — one of ``verify``, ``verify-trusted``, ``verify-policy``
+  or ``verify-selected``;
 * ``args`` — an array of strings with the same length and meaning as the
-  chosen command's positional arguments (3, 3 or 4).
+  chosen command's positional arguments (3, 3, 4 or 4).
 
 Relative paths in ``args`` are resolved against the directory holding the
 BATCH file; the BATCH file must sit outside every item's delivery tree,
@@ -32,6 +32,7 @@ ARITY = {
     "verify": 3,
     "verify-trusted": 3,
     "verify-policy": 4,
+    "verify-selected": 4,
 }
 _ITEM_FIELDS = ("id", "command", "args")
 
@@ -109,7 +110,8 @@ OUTCOMES = {0: "passed", 1: "failed", 2: "error"}
 def classify_error(error: Exception) -> str:
     """Map a per-item failure to a stable ``error_kind``.
 
-    * ``changed`` — the delivery tree changed while it was being scanned;
+    * ``changed`` — the delivery tree changed while it was being scanned
+      or a selected file changed while it was being read;
     * ``unsafe`` — a safety restriction was violated (support files or
       forbidden content inside the delivery tree, links or special
       files in the tree);
@@ -120,7 +122,7 @@ def classify_error(error: Exception) -> str:
     * ``internal`` — anything unexpected.
     """
     message = str(error)
-    if "changed while scanning" in message:
+    if "changed while scanning" in message or "changed while reading" in message:
         return "changed"
     if (
         "outside the delivery tree" in message
@@ -149,6 +151,10 @@ def _run_item(command: str, args: list[Path]) -> dict:
         from .trust import verify_trusted
 
         return verify_trusted(args[0], args[1], args[2])
+    if command == "verify-selected":
+        from .selected import verify_selected
+
+        return verify_selected(args[0], args[1], args[2], args[3])
     from .policy import verify_policy
 
     return verify_policy(args[0], args[1], args[2], args[3])
