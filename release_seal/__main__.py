@@ -140,6 +140,28 @@ def main() -> int:
     auditing.add_argument(
         "report", help="audit report to create; must not exist yet"
     )
+    chaining = commands.add_parser(
+        "audit-chain",
+        help="verify a BATCH and append an immutable hash-chained audit report",
+    )
+    chaining.add_argument("batch", help="BATCH JSON file of verify items")
+    chaining.add_argument(
+        "previous",
+        help="previous chain report, or '-' to start the chain at sequence 1",
+    )
+    chaining.add_argument(
+        "report", help="chain report to create; must not exist yet"
+    )
+    chain_check = commands.add_parser(
+        "audit-chain-verify",
+        help="verify ordered hash-chained audit reports against a head digest",
+    )
+    chain_check.add_argument(
+        "expected_head", help="expected SHA-256 hex digest of the last REPORT"
+    )
+    chain_check.add_argument(
+        "report", nargs="+", help="chain reports in chain order, head last"
+    )
     trust = commands.add_parser(
         "trust", help="manage the offline public-key trust store"
     )
@@ -216,6 +238,18 @@ def main() -> int:
             from .audit import audit_batch
 
             code, result = audit_batch(args.batch, args.report)
+        elif args.command == "audit-chain":
+            from .audit import audit_chain
+
+            code, result = audit_chain(
+                args.batch, args.previous, args.report
+            )
+        elif args.command == "audit-chain-verify":
+            from .audit import audit_chain_verify
+
+            code, result = audit_chain_verify(
+                args.expected_head, args.report
+            )
         elif args.command == "trust":
             from .trust import import_key, revoke_key
 
