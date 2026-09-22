@@ -28,6 +28,20 @@ first mismatch prints ``valid: false`` with ``reason: "broken_chain"``
 and the offending ``index`` and exits 1; argument, format or I/O
 problems go to standard error with exit code 2.
 
+``audit-chain-verify-set EXPECTED_HEAD REPORT...`` takes the same
+reports in unknown order: each is strictly validated and hashed over
+its raw bytes, the unique report whose digest is EXPECTED_HEAD anchors
+the set, and the chain is reconstructed solely by walking
+``previous_sha256`` backwards until the chain start (sequence 1, null
+previous digest), with each step decrementing the sequence by exactly
+one and consuming exactly one report. Success prints ``valid: true``
+with ``count`` and ``head_sha256`` and exits 0; an incomplete relation
+prints ``valid: false`` with ``reason: "broken_chain"`` and a
+``problem`` of ``head_not_found``, ``duplicate_report``,
+``missing_previous``, ``invalid_link`` or ``unused_report`` and exits
+1; argument, format or I/O problems go to standard error with exit
+code 2.
+
 REPORT (and PREVIOUS, when given) must stay outside every item's
 delivery tree and REPORT is never overwritten: the bytes land in a
 synced hidden temp file in the same directory and are published with a
@@ -128,6 +142,20 @@ def validate_chain_report_document(document: object) -> dict:
     return document
 
 
+def _parse_chain_report(raw: bytes, path: Path) -> dict:
+    """Decode and strictly validate one chain report's raw bytes."""
+    try:
+        document = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise SealError(
+            f"audit chain report is not UTF-8 JSON: {path}: {error}"
+        ) from error
+    try:
+        return validate_chain_report_document(document)
+    except SealError as error:
+        raise SealError(f"{error}: {path}") from error
+
+
 def _load_chain_report(path: Path) -> tuple[bytes, dict]:
     """Read a chain report file, returning its raw bytes and document."""
     try:
@@ -136,16 +164,7 @@ def _load_chain_report(path: Path) -> tuple[bytes, dict]:
         raise SealError(
             f"cannot read audit chain report {path}: {error}"
         ) from error
-    try:
-        document = json.loads(raw.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError) as error:
-        raise SealError(
-            f"audit chain report is not UTF-8 JSON: {path}: {error}"
-        ) from error
-    try:
-        return raw, validate_chain_report_document(document)
-    except SealError as error:
-        raise SealError(f"{error}: {path}") from error
+    return raw, _parse_chain_report(raw, path)
 
 
 def audit_chain(batch_path, previous, report_path) -> tuple[int, dict]:
@@ -249,6 +268,84 @@ def verify_chain(expected_head, report_paths) -> tuple[int, dict]:
             "reason": "broken_chain",
             "index": len(paths) - 1,
         }
+    return 0, {
+        "valid": True,
+        "count": len(paths),
+        "head_sha256": expected_head,
+    }
+
+
+def _set_problem(problem: str) -> tuple[int, dict]:
+    return 1, {
+        "valid": False,
+        "reason": "broken_chain",
+        "problem": problem,
+    }
+
+
+def verify_chain_set(expected_head, report_paths) -> tuple[int, dict]:
+    """Verify an unordered set of chain reports against an expected head.
+
+    Every REPORT is read once, strictly validated and hashed over its
+    raw bytes; argument order carries no meaning. The unique report
+    whose raw bytes hash to ``expected_head`` anchors the set, and the
+    chain is reconstructed solely by following ``previous_sha256``
+    backwards: each predecessor must hash to the current report's
+    ``previous_sha256`` and carry a sequence exactly one lower, until
+    the chain start (sequence 1, null previous digest), and the walk
+    must use every input exactly once. Returns ``(0, {"valid": True,
+    "count", "head_sha256"})`` on success and ``(1, {"valid": False,
+    "reason": "broken_chain", "problem"})`` otherwise, with ``problem``
+    one of ``head_not_found``, ``duplicate_report``,
+    ``missing_previous``, ``invalid_link`` or ``unused_report``.
+    Argument, format and I/O problems raise :class:`SealError`
+    (standard error, exit code 2).
+    """
+    if not is_key_id(expected_head):
+        raise SealError(
+            "expected head must be 64 lowercase hex digits: "
+            f"{expected_head!r}"
+        )
+    paths = [Path(path) for path in report_paths]
+    if not paths:
+        raise SealError("audit-chain-verify-set needs at least one report")
+    records: list[tuple[bytes, dict]] = []
+    digests: list[str] = []
+    for path in paths:
+        try:
+            raw = path.read_bytes()
+        except OSError as error:
+            raise SealError(
+                f"cannot read audit chain report {path}: {error}"
+            ) from error
+        records.append((raw, _parse_chain_report(raw, path)))
+        digests.append(hashlib.sha256(raw).hexdigest())
+    if len(set(digests)) != len(digests):
+        return _set_problem("duplicate_report")
+    by_digest = {
+        digest: document for digest, (_, document) in zip(digests, records)
+    }
+    if expected_head not in by_digest:
+        return _set_problem("head_not_found")
+    used: set[str] = set()
+    digest = expected_head
+    while True:
+        document = by_digest[digest]
+        used.add(digest)
+        previous = document["previous_sha256"]
+        sequence = document["sequence"]
+        if previous is None:
+            if sequence != 1:
+                return _set_problem("invalid_link")
+            break
+        predecessor = by_digest.get(previous)
+        if predecessor is None:
+            return _set_problem("missing_previous")
+        if predecessor["sequence"] != sequence - 1:
+            return _set_problem("invalid_link")
+        digest = previous
+    if used != set(digests):
+        return _set_problem("unused_report")
     return 0, {
         "valid": True,
         "count": len(paths),

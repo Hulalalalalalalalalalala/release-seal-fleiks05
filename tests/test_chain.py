@@ -19,6 +19,7 @@ from release_seal.chain import (
     audit_chain,
     validate_chain_report_document,
     verify_chain,
+    verify_chain_set,
 )
 from release_seal.seal import SealError, sign_directory, verify_directory
 
@@ -377,6 +378,180 @@ class VerifyChainTests(ChainTestCase):
             verify_chain("0" * 64, [])
 
 
+class VerifyChainSetTests(ChainTestCase):
+    def write_report(self, sequence, previous_sha256, name, *, batch="0" * 64):
+        report = {
+            "kind": CHAIN_REPORT_KIND,
+            "version": 2,
+            "sequence": sequence,
+            "previous_sha256": previous_sha256,
+            "batch_sha256": batch,
+            "valid": True,
+            "summary": {"total": 0, "passed": 0, "failed": 0, "errors": 0},
+            "results": [],
+        }
+        path = self.work / name
+        path.write_text(
+            json.dumps(report, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        return path
+
+    def test_valid_set_in_input_order(self):
+        paths = self.make_chain(3)
+        code, result = verify_chain_set(sha256_of(paths[-1]), paths)
+        self.assertEqual(code, 0)
+        self.assertEqual(
+            result,
+            {
+                "valid": True,
+                "count": 3,
+                "head_sha256": sha256_of(paths[-1]),
+            },
+        )
+
+    def test_valid_set_in_unknown_order(self):
+        paths = self.make_chain(3)
+        for ordering in (
+            list(reversed(paths)),
+            [paths[1], paths[2], paths[0]],
+            [paths[2], paths[0], paths[1]],
+        ):
+            with self.subTest(ordering=[p.name for p in ordering]):
+                code, result = verify_chain_set(
+                    sha256_of(paths[-1]), ordering
+                )
+                self.assertEqual(code, 0)
+                self.assertTrue(result["valid"])
+                self.assertEqual(result["count"], 3)
+
+    def test_single_genesis_report(self):
+        paths = self.make_chain(1)
+        code, result = verify_chain_set(sha256_of(paths[0]), [paths[0]])
+        self.assertEqual(code, 0)
+        self.assertEqual(result["count"], 1)
+        self.assertEqual(result["head_sha256"], sha256_of(paths[0]))
+
+    def test_head_not_found(self):
+        paths = self.make_chain(3)
+        code, result = verify_chain_set("0" * 64, paths)
+        self.assertEqual(code, 1)
+        self.assertEqual(
+            result,
+            {"valid": False, "reason": "broken_chain",
+             "problem": "head_not_found"},
+        )
+        self.assertNotIn("head_sha256", result)
+
+    def test_duplicate_report_same_path_twice(self):
+        paths = self.make_chain(2)
+        code, result = verify_chain_set(
+            sha256_of(paths[-1]), [paths[0], paths[1], paths[1]],
+        )
+        self.assertEqual(code, 1)
+        self.assertEqual(result["problem"], "duplicate_report")
+
+    def test_duplicate_report_bytes_copied_to_another_file(self):
+        paths = self.make_chain(2)
+        duplicate = self.work / "copy.json"
+        duplicate.write_bytes(paths[0].read_bytes())
+        code, result = verify_chain_set(
+            sha256_of(paths[-1]), [paths[0], paths[1], duplicate],
+        )
+        self.assertEqual(code, 1)
+        self.assertEqual(result["problem"], "duplicate_report")
+
+    def test_missing_previous_when_intermediate_report_absent(self):
+        paths = self.make_chain(3)
+        code, result = verify_chain_set(
+            sha256_of(paths[2]), [paths[0], paths[2]],
+        )
+        self.assertEqual(code, 1)
+        self.assertEqual(result["problem"], "missing_previous")
+
+    def test_missing_previous_when_only_head_given(self):
+        paths = self.make_chain(2)
+        code, result = verify_chain_set(
+            sha256_of(paths[1]), [paths[1]],
+        )
+        self.assertEqual(code, 1)
+        self.assertEqual(result["problem"], "missing_previous")
+
+    def test_invalid_link_when_sequence_does_not_decrement_by_one(self):
+        first = self.write_report(1, None, "a.json")
+        # Sequence 3 claims a report whose sequence is 1 as its predecessor:
+        # the digest exists in the set but the sequence is not 2.
+        third = self.write_report(3, sha256_of(first), "c.json")
+        code, result = verify_chain_set(
+            sha256_of(third), [first, third],
+        )
+        self.assertEqual(code, 1)
+        self.assertEqual(result["problem"], "invalid_link")
+
+    def test_unused_orphan_report_is_not_ignored(self):
+        paths = self.make_chain(2)
+        orphan = self.write_report(1, None, "orphan.json")
+        code, result = verify_chain_set(
+            sha256_of(paths[-1]), [*paths, orphan],
+        )
+        self.assertEqual(code, 1)
+        self.assertEqual(result["problem"], "unused_report")
+
+    def test_unused_fork_report_is_not_ignored(self):
+        first = self.write_report(1, None, "a.json")
+        second = self.write_report(2, sha256_of(first), "b.json")
+        fork = self.write_report(
+            2, sha256_of(first), "fork.json", batch="1" * 64,
+        )
+        code, result = verify_chain_set(
+            sha256_of(second), [first, second, fork],
+        )
+        self.assertEqual(code, 1)
+        self.assertEqual(result["problem"], "unused_report")
+
+    def test_extra_prefix_reports_are_unused(self):
+        paths = self.make_chain(3)
+        # Head anchored at report 2 leaves the real report 3 as an orphan.
+        code, result = verify_chain_set(
+            sha256_of(paths[1]), paths,
+        )
+        self.assertEqual(code, 1)
+        self.assertEqual(result["problem"], "unused_report")
+
+    def test_missing_report_file_is_an_error(self):
+        with self.assertRaises(SealError):
+            verify_chain_set("0" * 64, [self.work / "absent.json"])
+
+    def test_malformed_report_is_an_error(self):
+        bad = self.work / "bad.json"
+        bad.write_bytes(b"not json")
+        with self.assertRaises(SealError):
+            verify_chain_set("0" * 64, [bad])
+
+    def test_structurally_invalid_report_is_an_error(self):
+        bad = self.work / "bad.json"
+        bad.write_text(json.dumps({"kind": CHAIN_REPORT_KIND}), encoding="utf-8")
+        with self.assertRaises(SealError):
+            verify_chain_set("0" * 64, [bad])
+
+    def test_bad_expected_head_is_an_error(self):
+        paths = self.make_chain(1)
+        for head in ("", "0" * 63, "0" * 65, "g" * 64, "A" * 64):
+            with self.subTest(head=head):
+                with self.assertRaises(SealError):
+                    verify_chain_set(head, paths)
+
+    def test_empty_report_list_is_an_error(self):
+        with self.assertRaises(SealError):
+            verify_chain_set("0" * 64, [])
+
+    def test_reports_are_not_modified(self):
+        paths = self.make_chain(2)
+        before = [path.read_bytes() for path in paths]
+        verify_chain_set(sha256_of(paths[-1]), list(reversed(paths)))
+        self.assertEqual([path.read_bytes() for path in paths], before)
+
+
 class ChainReportInTreeTests(ChainTestCase):
     def test_valid_chain_report_in_tree_is_rejected_by_content(self):
         paths = self.make_chain(1)
@@ -487,6 +662,47 @@ class AuditChainCliTests(ChainTestCase):
 
     def test_cli_verify_requires_a_report(self):
         result = run_cli("audit-chain-verify", "0" * 64)
+        self.assertEqual(result.returncode, 2)
+        self.assertNotEqual(result.stderr, "")
+
+    def test_cli_verify_set_valid_in_any_order(self):
+        paths = self.make_chain(3)
+        result = run_cli(
+            "audit-chain-verify-set",
+            sha256_of(paths[-1]),
+            *reversed(paths),
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stderr, "")
+        printed = json.loads(result.stdout)
+        self.assertEqual(
+            printed,
+            {"valid": True, "count": 3, "head_sha256": sha256_of(paths[-1])},
+        )
+
+    def test_cli_verify_set_broken_chain(self):
+        paths = self.make_chain(2)
+        result = run_cli(
+            "audit-chain-verify-set", "0" * 64, *paths,
+        )
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(result.stderr, "")
+        self.assertEqual(
+            json.loads(result.stdout),
+            {"valid": False, "reason": "broken_chain",
+             "problem": "head_not_found"},
+        )
+
+    def test_cli_verify_set_format_error_writes_stderr(self):
+        bad = self.work / "bad.json"
+        bad.write_bytes(b"{}")
+        result = run_cli("audit-chain-verify-set", "0" * 64, bad)
+        self.assertEqual(result.returncode, 2)
+        self.assertNotEqual(result.stderr, "")
+        self.assertEqual(result.stdout, "")
+
+    def test_cli_verify_set_requires_a_report(self):
+        result = run_cli("audit-chain-verify-set", "0" * 64)
         self.assertEqual(result.returncode, 2)
         self.assertNotEqual(result.stderr, "")
 
