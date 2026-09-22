@@ -28,6 +28,20 @@ first mismatch prints ``valid: false`` with ``reason: "broken_chain"``
 and the offending ``index`` and exits 1; argument, format or I/O
 problems go to standard error with exit code 2.
 
+``audit-chain-verify-set EXPECTED_HEAD REPORT...`` takes one or more
+reports in an unknown order — the argument order is not the chain
+order — and reconstructs the chain backwards from the unique report
+whose raw bytes hash to EXPECTED_HEAD, following ``previous_sha256``
+links. The walk must reach the chain start (sequence 1, null previous
+digest), sequences must drop by exactly one at each step and every
+input report must be used exactly once. Success prints ``valid: true``
+with ``count`` and ``head_sha256`` and exits 0; an incomplete relation
+prints ``valid: false`` with ``reason: "broken_chain"`` and a
+``problem`` of ``head_not_found``, ``duplicate_report``,
+``missing_previous``, ``invalid_link`` or ``unused_report`` and exits
+1; argument, format or I/O problems go to standard error with exit
+code 2.
+
 REPORT (and PREVIOUS, when given) must stay outside every item's
 delivery tree and REPORT is never overwritten: the bytes land in a
 synced hidden temp file in the same directory and are published with a
@@ -252,5 +266,81 @@ def verify_chain(expected_head, report_paths) -> tuple[int, dict]:
     return 0, {
         "valid": True,
         "count": len(paths),
+        "head_sha256": expected_head,
+    }
+
+
+def _broken(problem: str) -> tuple[int, dict]:
+    return 1, {
+        "valid": False,
+        "reason": "broken_chain",
+        "problem": problem,
+    }
+
+
+def verify_chain_set(expected_head, report_paths) -> tuple[int, dict]:
+    """Verify an unordered set of chain reports against a head digest.
+
+    Unlike :func:`verify_chain`, the argument order carries no meaning.
+    Every report is read and strictly validated and its raw bytes are
+    hashed. The unique report whose digest equals ``expected_head`` is
+    the head; the chain is then reconstructed solely through
+    ``previous_sha256`` links. The walk must land on the chain start
+    (sequence 1, null previous digest), each step must lower the
+    sequence by exactly one and match the predecessor's raw-byte
+    digest, and every input report must be used. Returns ``(0,
+    {"valid": True, "count", "head_sha256"})`` on success and ``(1,
+    {"valid": False, "reason": "broken_chain", "problem"})`` otherwise,
+    where ``problem`` is ``head_not_found``, ``duplicate_report``,
+    ``missing_previous``, ``invalid_link`` or ``unused_report``.
+    Argument, format and I/O problems raise :class:`SealError`
+    (standard error, exit code 2).
+    """
+    if not is_key_id(expected_head):
+        raise SealError(
+            "expected head must be 64 lowercase hex digits: "
+            f"{expected_head!r}"
+        )
+    paths = [Path(path) for path in report_paths]
+    if not paths:
+        raise SealError("audit-chain-verify-set needs at least one report")
+    loaded: list[tuple[bytes, dict]] = []
+    by_digest: dict[str, tuple[bytes, dict]] = {}
+    for path in paths:
+        raw, document = _load_chain_report(path)
+        digest = hashlib.sha256(raw).hexdigest()
+        if digest in by_digest:
+            return _broken("duplicate_report")
+        by_digest[digest] = (raw, document)
+        loaded.append((raw, document))
+    head = by_digest.get(expected_head)
+    if head is None:
+        return _broken("head_not_found")
+    used: set[str] = {expected_head}
+    document = head[1]
+    while document["sequence"] != 1:
+        previous_digest = document["previous_sha256"]
+        # A non-start report always carries a digest here: strict
+        # validation only permits previous_sha256 null on sequence 1.
+        predecessor = by_digest.get(previous_digest)
+        if predecessor is None:
+            return _broken("missing_previous")
+        previous_raw, previous_document = predecessor
+        if (
+            previous_digest in used
+            or previous_document["sequence"] != document["sequence"] - 1
+            or document["previous_sha256"]
+            != hashlib.sha256(previous_raw).hexdigest()
+        ):
+            return _broken("invalid_link")
+        used.add(previous_digest)
+        document = previous_document
+    if document["previous_sha256"] is not None:  # pragma: no cover
+        return _broken("invalid_link")
+    if len(used) != len(loaded):
+        return _broken("unused_report")
+    return 0, {
+        "valid": True,
+        "count": len(loaded),
         "head_sha256": expected_head,
     }

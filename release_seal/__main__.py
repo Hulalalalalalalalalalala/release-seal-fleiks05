@@ -174,6 +174,19 @@ def main() -> int:
     chain_check.add_argument(
         "reports", nargs="+", help="chain report files in chain order"
     )
+    chain_set_check = commands.add_parser(
+        "audit-chain-verify-set",
+        help="verify an unordered set of chain reports against an expected head",
+    )
+    chain_set_check.add_argument(
+        "expected_head",
+        help="lowercase SHA-256 hex of the last report's raw bytes",
+    )
+    chain_set_check.add_argument(
+        "reports",
+        nargs="+",
+        help="chain report files in any order; the chain order is reconstructed",
+    )
     trust = commands.add_parser(
         "trust", help="manage the offline public-key trust store"
     )
@@ -265,6 +278,10 @@ def main() -> int:
             from .chain import verify_chain
 
             code, result = verify_chain(args.expected_head, args.reports)
+        elif args.command == "audit-chain-verify-set":
+            from .chain import verify_chain_set
+
+            code, result = verify_chain_set(args.expected_head, args.reports)
         elif args.command == "trust":
             from .trust import import_key, revoke_key
 

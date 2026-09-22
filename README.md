@@ -1,6 +1,6 @@
 # Release Seal
 
-为本地文件交付目录生成可读的文件清单，并用 Ed25519 签名实现可信的离线交付。需要 Python 3.10 或更高版本；`inventory` 仅依赖标准库，`sign`、`sign-multi`、`sign-incremental`、`verify`、`verify-selected`、`verify-incremental`、`trust`、`verify-trusted`、`verify-policy`、`verify-batch`、`audit-batch`、`audit-chain`、`audit-chain-verify` 和 `demo` 需要 `cryptography` 包。
+为本地文件交付目录生成可读的文件清单，并用 Ed25519 签名实现可信的离线交付。需要 Python 3.10 或更高版本；`inventory` 仅依赖标准库，`sign`、`sign-multi`、`sign-incremental`、`verify`、`verify-selected`、`verify-incremental`、`trust`、`verify-trusted`、`verify-policy`、`verify-batch`、`audit-batch`、`audit-chain`、`audit-chain-verify`、`audit-chain-verify-set` 和 `demo` 需要 `cryptography` 包。
 
 ```sh
 python3 -m release_seal --help
@@ -20,6 +20,7 @@ python3 -m release_seal audit-batch batch.json audit-report.json
 python3 -m release_seal audit-chain batch.json - chain-1.json
 python3 -m release_seal audit-chain batch.json chain-1.json chain-2.json
 python3 -m release_seal audit-chain-verify HEAD_SHA256 chain-1.json chain-2.json
+python3 -m release_seal audit-chain-verify-set HEAD_SHA256 chain-2.json chain-1.json
 python3 -m release_seal demo
 python3 -m unittest discover -s tests -v
 ```
@@ -148,6 +149,23 @@ REPORT 是 UTF-8 JSON 对象，恰好包含八个字段：`kind`（`"release-sea
 - 链完整：输出 `valid:true`、`count`（报告份数）和 `head_sha256`，返回 0。
 - 首个不符（起点不对、序号断档、链接不符或末份摘要不匹配）：输出 `valid:false`、`reason:"broken_chain"` 和出问题的 `index`，返回 1。
 - 参数、格式或 I/O 错误（EXPECTED_HEAD 不是 64 位小写十六进制、缺少报告、报告无法读取或无法完整校验）：原因写标准错误，返回 2。
+
+### audit-chain-verify-set EXPECTED_HEAD REPORT...：乱序集合校验审计链
+
+`audit-chain-verify-set EXPECTED_HEAD REPORT...` 核验一份顺序**未知**的 version 2 审计链报告集合：参数顺序不代表链序，REPORT 至少一份。每份报告都复用 `audit-chain-verify` 的严格格式校验（无法完整校验即为格式错误），并计算其文件原始字节的 SHA-256 小写十六进制摘要。
+
+从摘要**恰好等于** EXPECTED_HEAD（64 位小写十六进制）的唯一报告出发，只按各报告的 `previous_sha256` 反向连接：每一步的前序摘要必须指向输入中的另一份报告、链接必须等于该前序报告原始字节的摘要、序号逐项恰减一，最终必须到达 `sequence` 为 1、`previous_sha256` 为 `null` 的链起点，并且**恰好使用全部输入报告**（不得忽略孤立报告后声称成功）。
+
+- 链完整：输出 `valid:true`、`count`（报告份数）和 `head_sha256`，返回 0。
+- 关系不完整：输出 `valid:false`、`reason:"broken_chain"` 和 `problem`，返回 1。`problem` 取值：
+  - `head_not_found`：没有任何报告的摘要等于 EXPECTED_HEAD；
+  - `duplicate_report`：输入中存在内容完全相同（摘要相同）的报告；
+  - `missing_previous`：某份报告的 `previous_sha256` 在输入中找不到对应前序；
+  - `invalid_link`：链接与前序原始字节摘要不符，或序号未逐项恰减一（含成环）；
+  - `unused_report`：反向走完一条合法链后仍有额外或孤立报告未被使用。
+- 参数、格式或 I/O 错误（EXPECTED_HEAD 不是 64 位小写十六进制、缺少报告、报告无法读取或无法完整校验）：原因写标准错误、返回 2、不输出 JSON。
+
+报告以只读方式打开，命令不修改任何输入。
 
 ## 扫描一致性与目录限制
 
