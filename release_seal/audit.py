@@ -81,6 +81,48 @@ def _validate_entry(entry: object) -> None:
         raise SealError("audit report entry 'result' must be an object")
 
 
+def validate_summary(summary: object) -> None:
+    """Strictly validate an audit ``summary`` object.
+
+    Shared by the version 1 audit report and the version 2 audit chain
+    report: exactly ``total``/``passed``/``failed``/``errors``, all
+    non-negative integers that add up.
+    """
+    if not isinstance(summary, dict) or set(summary) != set(SUMMARY_FIELDS):
+        raise SealError(
+            "audit report 'summary' must contain exactly "
+            + ", ".join(SUMMARY_FIELDS)
+        )
+    for field in SUMMARY_FIELDS:
+        value = summary[field]
+        if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+            raise SealError(
+                f"audit report summary field {field!r} must be a "
+                "non-negative integer"
+            )
+    if (
+        summary["passed"] + summary["failed"] + summary["errors"]
+        != summary["total"]
+    ):
+        raise SealError("audit report summary counts do not add up")
+
+
+def validate_results(results: object, summary: dict) -> None:
+    """Strictly validate audit ``results`` against their ``summary``."""
+    if not isinstance(results, list) or len(results) != summary["total"]:
+        raise SealError("audit report 'results' must match summary 'total'")
+    tallies = {0: 0, 1: 0, 2: 0}
+    for entry in results:
+        _validate_entry(entry)
+        tallies[entry["code"]] += 1
+    if (
+        tallies[0] != summary["passed"]
+        or tallies[1] != summary["failed"]
+        or tallies[2] != summary["errors"]
+    ):
+        raise SealError("audit report summary does not match its results")
+
+
 def validate_audit_report_document(document: object) -> dict:
     """Strictly validate a parsed audit report JSON document.
 
@@ -113,40 +155,38 @@ def validate_audit_report_document(document: object) -> dict:
         )
     if not isinstance(document["valid"], bool):
         raise SealError("audit report field 'valid' must be a boolean")
-    summary = document["summary"]
-    if not isinstance(summary, dict) or set(summary) != set(SUMMARY_FIELDS):
-        raise SealError(
-            "audit report 'summary' must contain exactly "
-            + ", ".join(SUMMARY_FIELDS)
-        )
-    for field in SUMMARY_FIELDS:
-        value = summary[field]
-        if not isinstance(value, int) or isinstance(value, bool) or value < 0:
-            raise SealError(
-                f"audit report summary field {field!r} must be a "
-                "non-negative integer"
-            )
-    if (
-        summary["passed"] + summary["failed"] + summary["errors"]
-        != summary["total"]
+    validate_summary(document["summary"])
+    if document["valid"] != (
+        document["summary"]["passed"] == document["summary"]["total"]
     ):
-        raise SealError("audit report summary counts do not add up")
-    if document["valid"] != (summary["passed"] == summary["total"]):
         raise SealError("audit report field 'valid' contradicts its summary")
-    results = document["results"]
-    if not isinstance(results, list) or len(results) != summary["total"]:
-        raise SealError("audit report 'results' must match summary 'total'")
-    tallies = {0: 0, 1: 0, 2: 0}
-    for entry in results:
-        _validate_entry(entry)
-        tallies[entry["code"]] += 1
-    if (
-        tallies[0] != summary["passed"]
-        or tallies[1] != summary["failed"]
-        or tallies[2] != summary["errors"]
-    ):
-        raise SealError("audit report summary does not match its results")
+    validate_results(document["results"], document["summary"])
     return document
+
+
+def audit_results(entries: list[dict]) -> list[dict]:
+    """Project executed batch entries into audit report result entries.
+
+    Each entry keeps ``id``, ``command``, ``code`` and ``outcome``; codes
+    0/1 attach the command's original ``result``, code 2 a non-empty
+    ``error`` and a stable ``error_kind``. Shared by the version 1 audit
+    report and the version 2 audit chain report.
+    """
+    results: list[dict] = []
+    for entry in entries:
+        audited: dict = {
+            "id": entry["id"],
+            "command": entry["command"],
+            "code": entry["code"],
+            "outcome": OUTCOMES[entry["code"]],
+        }
+        if entry["code"] == 2:
+            audited["error"] = entry["error"]
+            audited["error_kind"] = entry["error_kind"]
+        else:
+            audited["result"] = entry["result"]
+        results.append(audited)
+    return results
 
 
 def audit_batch(batch_path, report_path) -> tuple[int, dict]:
@@ -173,27 +213,13 @@ def audit_batch(batch_path, report_path) -> tuple[int, dict]:
         require_outside(base / item["args"][0], (report_path,))
     entries = execute_items(items, base, batch_path)
     summary = summarize(entries)
-    results: list[dict] = []
-    for entry in entries:
-        audited: dict = {
-            "id": entry["id"],
-            "command": entry["command"],
-            "code": entry["code"],
-            "outcome": OUTCOMES[entry["code"]],
-        }
-        if entry["code"] == 2:
-            audited["error"] = entry["error"]
-            audited["error_kind"] = entry["error_kind"]
-        else:
-            audited["result"] = entry["result"]
-        results.append(audited)
     report = {
         "kind": AUDIT_REPORT_KIND,
         "version": AUDIT_REPORT_VERSION,
         "batch_sha256": hashlib.sha256(raw).hexdigest(),
         "valid": summary["passed"] == summary["total"],
         "summary": summary,
-        "results": results,
+        "results": audit_results(entries),
     }
     data = (json.dumps(report, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
     publish_new(report_path, data, hint="audit-report", noun="audit report")

@@ -319,11 +319,11 @@ def _forbidden_json_document(document: object) -> str | None:
 
     Only a document that *fully* validates as a version 1/2/3 manifest, a
     version 4 delta manifest, a version 1 trust store, a three-field
-    version 1 policy or a version 1 audit report is forbidden. A merely
-    similar object (right field names but invalid values, a foreign
-    ``kind`` or ``version``) passes. Imports live here to avoid an import
-    cycle: ``trust``, ``policy``, ``audit`` and ``incremental`` import
-    from this module.
+    version 1 policy, a version 1 audit report or a version 2 audit chain
+    report is forbidden. A merely similar object (right field names but
+    invalid values, a foreign ``kind`` or ``version``) passes. Imports
+    live here to avoid an import cycle: ``trust``, ``policy``, ``audit``,
+    ``chain`` and ``incremental`` import from this module.
     """
     if not isinstance(document, dict):
         return None
@@ -362,8 +362,16 @@ def _forbidden_json_document(document: object) -> str | None:
     try:
         validate_audit_report_document(document)
     except SealError:
+        pass
+    else:
+        return "audit reports must stay outside the delivery tree"
+    from .chain import validate_chain_report_document
+
+    try:
+        validate_chain_report_document(document)
+    except SealError:
         return None
-    return "audit reports must stay outside the delivery tree"
+    return "audit chain reports must stay outside the delivery tree"
 
 
 _PEM_MARKER = b"-----BEGIN"
@@ -418,9 +426,10 @@ def reject_forbidden_files(directory: Path, files: list[dict]) -> None:
     encrypted PEM private key missing its password), or when they parse as
     UTF-8 JSON fully validating as a version 1/2/3 manifest, a version 4
     delta manifest, a version 1 trust store, a three-field version 1
-    policy or a version 1 audit report. Certificates, ordinary PEM,
-    DER/OpenSSH/PKCS#12 blobs and malformed-but-similar JSON are all
-    deliverable, whatever the file is called.
+    policy, a version 1 audit report or a version 2 audit chain report.
+    Certificates, ordinary PEM, DER/OpenSSH/PKCS#12 blobs and
+    malformed-but-similar JSON are all deliverable, whatever the file is
+    called.
     """
     for record in files:
         rel = record["path"]
@@ -448,7 +457,7 @@ def guarded_inventory(directory: Path) -> list[dict]:
     read (hashing and forbidden-file classification) happens between the
     two snapshots, so a swapped or modified file is always caught. The
     tree is also refused if it contains keys, manifests, delta manifests,
-    trust stores, policies or audit reports.
+    trust stores, policies, audit reports or audit chain reports.
     """
     before = stat_snapshot(directory)
     files = inventory(directory)

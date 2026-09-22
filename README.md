@@ -1,6 +1,6 @@
 # Release Seal
 
-为本地文件交付目录生成可读的文件清单，并用 Ed25519 签名实现可信的离线交付。需要 Python 3.10 或更高版本；`inventory` 仅依赖标准库，`sign`、`sign-multi`、`sign-incremental`、`verify`、`verify-incremental`、`trust`、`verify-trusted`、`verify-policy`、`verify-batch`、`audit-batch` 和 `demo` 需要 `cryptography` 包。
+为本地文件交付目录生成可读的文件清单，并用 Ed25519 签名实现可信的离线交付。需要 Python 3.10 或更高版本；`inventory` 仅依赖标准库，`sign`、`sign-multi`、`sign-incremental`、`verify`、`verify-incremental`、`trust`、`verify-trusted`、`verify-policy`、`verify-batch`、`audit-batch`、`audit-chain`、`audit-chain-verify` 和 `demo` 需要 `cryptography` 包。
 
 ```sh
 python3 -m release_seal --help
@@ -16,6 +16,9 @@ python3 -m release_seal verify-trusted examples/package manifest.json trust.json
 python3 -m release_seal verify-policy examples/package manifest.json trust.json policy.json
 python3 -m release_seal verify-batch batch.json
 python3 -m release_seal audit-batch batch.json audit-report.json
+python3 -m release_seal audit-chain batch.json - chain-1.json
+python3 -m release_seal audit-chain batch.json chain-1.json chain-2.json
+python3 -m release_seal audit-chain-verify HEAD_SHA256 chain-1.json chain-2.json
 python3 -m release_seal demo
 python3 -m unittest discover -s tests -v
 ```
@@ -119,12 +122,26 @@ REPORT 是 UTF-8 JSON 对象，恰好包含六个字段：`kind`（`"release-sea
 
 REPORT 必须位于所有交付树之外且绝不覆盖已有文件：先在目标目录写入同步过的隐藏临时文件（写入后 `fsync`），再通过一次**不覆盖**的硬链接发布，最后同步目录。发布前失败不留任何残留；发布后若目录 `fsync` 失败，完整报告保留在原位、临时文件被清理、返回 2 并提示耐久性不确定。成功后标准输出打印该报告，退出码沿用批量结果（任一项为 2 则 2，否则任一项为 1 则 1，否则 0）。
 
+### audit-chain BATCH PREVIOUS REPORT：哈希链审计报告
+
+`audit-chain BATCH PREVIOUS REPORT` 执行与 `audit-batch` 完全相同的批量校验（BATCH 格式、相对路径基准、执行顺序、目录限制、空批次合法性和返回码都一致），并把本次运行追加为一份**哈希链**审计报告 REPORT。PREVIOUS 为 `-` 时创建链起点；否则 PREVIOUS 必须是一份合法的链报告，新报告接在其后。BATCH 结构错误、PREVIOUS 缺失或非法、任何 I/O 错误：原因写标准错误、返回 2、**不创建报告**。
+
+REPORT 是 UTF-8 JSON 对象，恰好包含八个字段：`kind`（`"release-seal-audit-chain"`）、`version`（`2`）、`sequence`、`previous_sha256`、`batch_sha256`、`valid`、`summary` 和 `results`。起点的 `sequence` 为 1、`previous_sha256` 为 `null`；后继报告的 `sequence` 为前序序号加一、`previous_sha256` 为前序报告文件**原始字节**的 SHA-256 小写十六进制。其余字段沿用版本 1 审计报告语义；报告不记录参数、密钥材料、签名或 traceback。REPORT 与 PREVIOUS 都必须位于所有交付树之外，REPORT 绝不覆盖已有文件，发布语义（同步临时文件 + 不覆盖硬链接 + 目录同步）与 `audit-batch` 完全一致。
+
+### audit-chain-verify EXPECTED_HEAD REPORT...：校验审计链
+
+`audit-chain-verify EXPECTED_HEAD REPORT...` 按链序接收一份或多份链报告，依次核对：首份必须是链起点（`sequence` 为 1、`previous_sha256` 为 `null`）、序号连续递增、每份的 `previous_sha256` 与前一份文件原始字节的 SHA-256 一致，且末份报告原始字节的 SHA-256 等于 EXPECTED_HEAD（64 位小写十六进制）。
+
+- 链完整：输出 `valid:true`、`count`（报告份数）和 `head_sha256`，返回 0。
+- 首个不符（起点不对、序号断档、链接不符或末份摘要不匹配）：输出 `valid:false`、`reason:"broken_chain"` 和出问题的 `index`，返回 1。
+- 参数、格式或 I/O 错误（EXPECTED_HEAD 不是 64 位小写十六进制、缺少报告、报告无法读取或无法完整校验）：原因写标准错误，返回 2。
+
 ## 扫描一致性与目录限制
 
 所有命令沿用相同的目录限制：输入必须是目录，目录树不支持符号链接和特殊文件（读取文件时使用 `O_NOFOLLOW`，防止检查后被换成符号链接）。私钥、公钥、清单、增量清单、信任库、策略、BATCH 文件和审计报告不得位于交付目录内——既包括命令行参数，也包括盘点时在交付树中发现的同类文件。树内识别**只看内容、不看文件名或扩展名**。
 
 - **密钥（PEM）**：文件内容依次尝试 `load_pem_public_key` 与 `load_pem_private_key(password=None)`；任意算法（Ed25519、RSA、EC 等）只要其中一个加载成功，或者私钥加载明确报告"加密私钥缺少密码"，都判定为真实密钥而拒绝。证书（`CERTIFICATE`）、普通文本、畸形 PEM 装甲不是密钥，可以交付。DER、OpenSSH 与 PKCS#12 不做检查，一律可以交付。
-- **JSON 文档**：只有能被**完整校验通过**的文档才被拒绝——版本 1/2/3 清单、版本 4 增量清单、版本 1 信任库、恰好三字段的版本 1 策略，或版本 1 审计报告。字段名相似但取值非法（如签名长度不对、版本号不符、算法不符、阈值非法、多/少字段、`removed` 未排序或与 `changes` 重叠、`kind` 不符、汇总计数与逐项结果不一致等）的"形似"文档**可以交付**。无法解析为 UTF-8 JSON 的字节也可以交付。扩展名不限：真实文档无论叫什么名字都拒绝，形似对象即使叫 `.json` 也放行。
+- **JSON 文档**：只有能被**完整校验通过**的文档才被拒绝——版本 1/2/3 清单、版本 4 增量清单、版本 1 信任库、恰好三字段的版本 1 策略、版本 1 审计报告或版本 2 审计链报告。字段名相似但取值非法（如签名长度不对、版本号不符、算法不符、阈值非法、多/少字段、`removed` 未排序或与 `changes` 重叠、`kind` 不符、汇总计数与逐项结果不一致、链起点带前序摘要或后继缺前序摘要等）的"形似"文档**可以交付**。无法解析为 UTF-8 JSON 的字节也可以交付。扩展名不限：真实文档无论叫什么名字都拒绝，形似对象即使叫 `.json` 也放行。
 
 签名或验证前后各取一次身份快照，核对路径、类型、文件身份 `(dev, ino)`、大小和纳秒修改时间；任何变化都返回 2，不产出清单，也不会把验证报告为成功。命令不会修改交付文件。读取失败时向标准错误输出原因，返回状态码 2。生成或验证过程中应保持输入目录不变。
 

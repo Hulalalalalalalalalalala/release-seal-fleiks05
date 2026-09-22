@@ -140,6 +140,29 @@ def main() -> int:
     auditing.add_argument(
         "report", help="audit report to create; must not exist yet"
     )
+    chaining = commands.add_parser(
+        "audit-chain",
+        help="verify a BATCH and publish a hash-chained audit report",
+    )
+    chaining.add_argument("batch", help="BATCH JSON file of verify items")
+    chaining.add_argument(
+        "previous",
+        help="previous chain report to build on, or '-' to start a chain",
+    )
+    chaining.add_argument(
+        "report", help="chain report to create; must not exist yet"
+    )
+    chain_check = commands.add_parser(
+        "audit-chain-verify",
+        help="verify a chain of audit reports against an expected head",
+    )
+    chain_check.add_argument(
+        "expected_head",
+        help="lowercase SHA-256 hex of the last report's raw bytes",
+    )
+    chain_check.add_argument(
+        "reports", nargs="+", help="chain report files in chain order"
+    )
     trust = commands.add_parser(
         "trust", help="manage the offline public-key trust store"
     )
@@ -216,6 +239,14 @@ def main() -> int:
             from .audit import audit_batch
 
             code, result = audit_batch(args.batch, args.report)
+        elif args.command == "audit-chain":
+            from .chain import audit_chain
+
+            code, result = audit_chain(args.batch, args.previous, args.report)
+        elif args.command == "audit-chain-verify":
+            from .chain import verify_chain
+
+            code, result = verify_chain(args.expected_head, args.reports)
         elif args.command == "trust":
             from .trust import import_key, revoke_key
 
