@@ -92,6 +92,17 @@ def main() -> int:
     checking.add_argument("directory", help="directory to check")
     checking.add_argument("manifest", help="signed manifest to trust")
     checking.add_argument("public", help="PEM Ed25519 public key to trust")
+    selected = commands.add_parser(
+        "verify-selected",
+        help="verify only the files named by a selection against a manifest",
+    )
+    selected.add_argument("directory", help="directory to check")
+    selected.add_argument("manifest", help="signed manifest to trust")
+    selected.add_argument("public", help="PEM Ed25519 public key to trust")
+    selected.add_argument(
+        "selection",
+        help="out-of-tree UTF-8 JSON array of manifest paths to check",
+    )
     inc_sign = commands.add_parser(
         "sign-incremental",
         help="sign a version 4 delta manifest against a version 2 base",
@@ -204,6 +215,13 @@ def main() -> int:
             from .seal import verify_directory
 
             result = verify_directory(args.directory, args.manifest, args.public)
+            code = 0 if result["valid"] else 1
+        elif args.command == "verify-selected":
+            from .selected import verify_selected
+
+            result = verify_selected(
+                args.directory, args.manifest, args.public, args.selection
+            )
             code = 0 if result["valid"] else 1
         elif args.command == "sign-incremental":
             from .incremental import sign_incremental_directory
